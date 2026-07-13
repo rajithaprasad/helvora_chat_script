@@ -18,6 +18,14 @@ const io = new Server(server, {
     },
     pingTimeout: 60000,
     pingInterval: 25000,
+    transports: ['websocket', 'polling'], // Allow both
+});
+
+// Handle WebSocket upgrade
+server.on('upgrade', (request, socket, head) => {
+    io.engine.handleUpgrade(request, socket, head, (ws) => {
+        io.engine.emit('connection', ws, request);
+    });
 });
 
 // Middleware
@@ -27,7 +35,6 @@ app.use(express.json());
 
 // ---------- HEALTH CHECK ENDPOINTS ----------
 
-// Root endpoint
 app.get('/', (req, res) => {
     res.json({
         status: 'ok',
@@ -42,10 +49,8 @@ app.get('/', (req, res) => {
     });
 });
 
-// Health check endpoint
 app.get('/health', async (req, res) => {
     try {
-        // Test database connection
         const [result] = await pool.query('SELECT 1 as connected');
         res.json({
             status: 'ok',
@@ -63,7 +68,6 @@ app.get('/health', async (req, res) => {
     }
 });
 
-// Database test endpoint
 app.get('/test-db', async (req, res) => {
     try {
         const [rows] = await pool.query('SELECT NOW() as server_time, DATABASE() as database_name');
@@ -98,11 +102,9 @@ io.on('connection', (socket) => {
     console.log(`🔵 User connected: ${userId} (${userName})`);
     console.log(`📊 Active connections: ${io.engine.clientsCount}`);
     
-    // Store user connection
     activeUsers.set(userId, socket.id);
     userSockets.set(socket.id, userId);
     
-    // Broadcast user online status
     io.emit('user_online', { 
         userId, 
         userName, 
@@ -114,7 +116,6 @@ io.on('connection', (socket) => {
     socket.on('join_chat', async ({ conversationId }) => {
         const roomName = `chat_${conversationId}`;
         
-        // Leave previous rooms
         const rooms = Array.from(socket.rooms);
         rooms.forEach(room => {
             if (room.startsWith('chat_')) {
@@ -122,7 +123,6 @@ io.on('connection', (socket) => {
             }
         });
         
-        // Join new room
         socket.join(roomName);
         socket.data.currentRoom = roomName;
         
@@ -145,7 +145,6 @@ io.on('connection', (socket) => {
                 timestamp: new Date().toISOString()
             });
             
-            // Get unread count
             const unreadCount = await getUnreadCount(conversationId, userId);
             socket.emit('unread_count', { conversationId, count: unreadCount });
             
@@ -194,7 +193,6 @@ io.on('connection', (socket) => {
             
             await updateConversationTimestamp(conversationId);
             
-            // Get updated unread count for other users
             const unreadCount = await getUnreadCount(conversationId, userId);
             socket.to(roomName).emit('unread_count', { 
                 conversationId, 
@@ -233,7 +231,6 @@ io.on('connection', (socket) => {
                 timestamp: new Date().toISOString()
             });
             
-            // Update unread count
             const unreadCount = await getUnreadCount(conversationId, userId);
             socket.emit('unread_count', { conversationId, count: unreadCount });
             
@@ -257,11 +254,9 @@ io.on('connection', (socket) => {
         console.log(`🔴 User disconnected: ${userId}`);
         console.log(`📊 Active connections: ${io.engine.clientsCount}`);
         
-        // Remove from active users
         activeUsers.delete(userId);
         userSockets.delete(socket.id);
         
-        // Broadcast offline status
         io.emit('user_offline', { 
             userId, 
             userName, 
@@ -365,13 +360,11 @@ async function getUnreadCount(conversationId, userId) {
 const PORT = process.env.PORT || 3000;
 
 async function startServer() {
-    // Test database connection first
     console.log('📊 Testing database connection...');
     const connected = await testConnection();
     
     if (!connected) {
-        console.error('⚠️  Database connection failed. The server will still start but may not work properly.');
-        console.error('📋 Please check your environment variables and database credentials.');
+        console.error('⚠️  Database connection failed.');
     } else {
         console.log('✅ Database connection established successfully.');
     }
@@ -381,7 +374,6 @@ async function startServer() {
         console.log(`📡 Socket.io ready for connections`);
         console.log(`🔗 Health check: https://${process.env.RENDER_EXTERNAL_HOSTNAME || 'localhost'}/health`);
         console.log(`🔗 WebSocket endpoint: wss://${process.env.RENDER_EXTERNAL_HOSTNAME || 'localhost'}`);
-        console.log(`📊 Active users tracking: ${activeUsers.size}`);
     });
 }
 
@@ -391,14 +383,12 @@ startServer().catch(console.error);
 process.on('SIGTERM', () => {
     console.log('🛑 Shutting down gracefully...');
     server.close(() => {
-        console.log('📊 Closing database connections...');
         pool.end();
         console.log('✅ Shutdown complete');
         process.exit(0);
     });
 });
 
-// Handle uncaught exceptions
 process.on('uncaughtException', (error) => {
     console.error('💥 Uncaught Exception:', error);
 });
