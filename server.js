@@ -3,6 +3,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const helmet = require('helmet');
+const jwt = require('jsonwebtoken'); // ✅ ADD THIS - was missing!
 require('dotenv').config();
 
 const { pool, testConnection } = require('./config/database');
@@ -19,14 +20,16 @@ const io = new Server(server, {
     pingTimeout: 60000,
     pingInterval: 25000,
     transports: ['websocket', 'polling'],
+    // Allow upgrades
+    allowUpgrades: true,
 });
 
-// Handle WebSocket upgrade
-server.on('upgrade', (request, socket, head) => {
-    io.engine.handleUpgrade(request, socket, head, (ws) => {
-        io.engine.emit('connection', ws, request);
-    });
-});
+// ✅ REMOVE this - it's causing the double upgrade error!
+// server.on('upgrade', (request, socket, head) => {
+//     io.engine.handleUpgrade(request, socket, head, (ws) => {
+//         io.engine.emit('connection', ws, request);
+//     });
+// });
 
 // Middleware
 app.use(cors());
@@ -88,39 +91,8 @@ app.get('/test-db', async (req, res) => {
 });
 
 // ---------- SOCKET.IO AUTHENTICATION ----------
-// For production - uncomment this line
-// io.use(authenticateSocket);
-
-// For testing - use this version that accepts any token
-io.use((socket, next) => {
-    const token = socket.handshake.auth.token;
-    console.log('🔑 Auth - Token received:', token ? `${token.substring(0, 20)}...` : 'No token');
-    
-    // If token is provided, try to decode it
-    if (token) {
-        try {
-            const decoded = jwt.verify(token, process.env.JWT_SECRET);
-            socket.data.userId = decoded.userId;
-            socket.data.userName = decoded.name || 'User';
-            console.log('✅ Authenticated user:', socket.data.userId);
-            next();
-        } catch (err) {
-            console.log('⚠️ JWT verification failed:', err.message);
-            // Fallback: use a default user ID for testing
-            socket.data.userId = 6;
-            socket.data.userName = 'Test User (Fallback)';
-            console.log('✅ Using fallback authentication for user:', socket.data.userId);
-            next();
-        }
-    } else {
-        console.log('⚠️ No token provided, using default user');
-        // For testing: allow connection without token
-        socket.data.userId = 6;
-        socket.data.userName = 'Guest User';
-        console.log('✅ Using guest authentication for user:', socket.data.userId);
-        next();
-    }
-});
+// Use the authenticateSocket middleware
+io.use(authenticateSocket);
 
 // Store active users
 const activeUsers = new Map();
@@ -134,9 +106,11 @@ io.on('connection', (socket) => {
     console.log(`🔵 User connected: ${userId} (${userName})`);
     console.log(`📊 Active connections: ${io.engine.clientsCount}`);
     
+    // Store user connection
     activeUsers.set(userId, socket.id);
     userSockets.set(socket.id, userId);
     
+    // Broadcast user online status
     io.emit('user_online', { 
         userId, 
         userName, 
@@ -148,6 +122,7 @@ io.on('connection', (socket) => {
     socket.on('join_chat', async ({ conversationId }) => {
         const roomName = `chat_${conversationId}`;
         
+        // Leave previous rooms
         const rooms = Array.from(socket.rooms);
         rooms.forEach(room => {
             if (room.startsWith('chat_')) {
