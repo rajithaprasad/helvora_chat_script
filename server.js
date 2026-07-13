@@ -25,13 +25,67 @@ app.use(cors());
 app.use(helmet());
 app.use(express.json());
 
+// ---------- HEALTH CHECK ENDPOINTS ----------
+
+// Root endpoint
+app.get('/', (req, res) => {
+    res.json({
+        status: 'ok',
+        service: 'Helvora WebSocket Server',
+        version: '1.0.0',
+        timestamp: new Date().toISOString(),
+        endpoints: {
+            health: '/health',
+            test_db: '/test-db',
+            websocket: 'wss://' + req.get('host')
+        }
+    });
+});
+
 // Health check endpoint
-app.get('/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+app.get('/health', async (req, res) => {
+    try {
+        // Test database connection
+        const [result] = await pool.query('SELECT 1 as connected');
+        res.json({
+            status: 'ok',
+            database: 'connected',
+            timestamp: new Date().toISOString(),
+            uptime: process.uptime()
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: 'error',
+            database: 'disconnected',
+            error: error.message,
+            timestamp: new Date().toISOString()
+        });
+    }
+});
+
+// Database test endpoint
+app.get('/test-db', async (req, res) => {
+    try {
+        const [rows] = await pool.query('SELECT NOW() as server_time, DATABASE() as database_name');
+        res.json({
+            success: true,
+            database: process.env.DB_NAME,
+            host: process.env.DB_HOST,
+            time: rows[0].server_time,
+            connection: 'active'
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error.message,
+            database: process.env.DB_NAME
+        });
+    }
 });
 
 // Store active users
 const activeUsers = new Map();
+const userSockets = new Map();
 
 // Authentication middleware for Socket.io
 io.use(authenticateSocket);
@@ -42,12 +96,19 @@ io.on('connection', (socket) => {
     const userName = socket.data.userName;
     
     console.log(`🔵 User connected: ${userId} (${userName})`);
+    console.log(`📊 Active connections: ${io.engine.clientsCount}`);
     
     // Store user connection
     activeUsers.set(userId, socket.id);
+    userSockets.set(socket.id, userId);
     
     // Broadcast user online status
-    io.emit('user_online', { userId, userName, status: 'online' });
+    io.emit('user_online', { 
+        userId, 
+        userName, 
+        status: 'online',
+        timestamp: new Date().toISOString()
+    });
     
     // ---------- JOIN CHAT ROOM ----------
     socket.on('join_chat', async ({ conversationId }) => {
@@ -67,26 +128,33 @@ io.on('connection', (socket) => {
         
         console.log(`📩 User ${userId} joined chat: ${conversationId}`);
         
-        // Send chat history (last 50 messages)
         try {
             const messages = await getChatHistory(conversationId, 50);
             socket.emit('chat_history', {
                 conversationId,
                 messages,
                 hasMore: messages.length === 50,
+                timestamp: new Date().toISOString()
             });
             
-            // Mark messages as read
             await markMessagesAsRead(conversationId, userId);
             
-            // Notify others that user has joined
             socket.to(roomName).emit('user_joined', {
                 userId,
                 userName,
+                timestamp: new Date().toISOString()
             });
+            
+            // Get unread count
+            const unreadCount = await getUnreadCount(conversationId, userId);
+            socket.emit('unread_count', { conversationId, count: unreadCount });
+            
         } catch (error) {
             console.error('Error loading chat history:', error);
-            socket.emit('error', { message: 'Failed to load chat history' });
+            socket.emit('error', { 
+                message: 'Failed to load chat history',
+                details: error.message 
+            });
         }
     });
     
@@ -100,7 +168,8 @@ io.on('connection', (socket) => {
                 return;
             }
             
-            // Save message to MySQL
+            console.log(`📝 Message from ${userId} in chat ${conversationId}: ${content.substring(0, 50)}...`);
+            
             const message = await saveMessage({
                 conversationId,
                 senderId: userId,
@@ -108,7 +177,6 @@ io.on('connection', (socket) => {
                 messageType,
             });
             
-            // Prepare message for broadcast
             const messageData = {
                 id: message.id,
                 conversationId,
@@ -121,16 +189,24 @@ io.on('connection', (socket) => {
                 is_read: 0,
             };
             
-            // Broadcast to room
             const roomName = `chat_${conversationId}`;
             io.to(roomName).emit('new_message', messageData);
             
-            // Update conversation timestamp
             await updateConversationTimestamp(conversationId);
+            
+            // Get updated unread count for other users
+            const unreadCount = await getUnreadCount(conversationId, userId);
+            socket.to(roomName).emit('unread_count', { 
+                conversationId, 
+                count: unreadCount 
+            });
             
         } catch (error) {
             console.error('Error sending message:', error);
-            socket.emit('error', { message: 'Failed to send message' });
+            socket.emit('error', { 
+                message: 'Failed to send message',
+                details: error.message 
+            });
         }
     });
     
@@ -141,33 +217,57 @@ io.on('connection', (socket) => {
             userId,
             userName,
             isTyping,
+            timestamp: new Date().toISOString()
         });
     });
     
     // ---------- MARK MESSAGES AS READ ----------
     socket.on('mark_read', async ({ conversationId }) => {
         try {
-            await markMessagesAsRead(conversationId, userId);
+            const updated = await markMessagesAsRead(conversationId, userId);
             
             const roomName = `chat_${conversationId}`;
             io.to(roomName).emit('messages_read', {
                 userId,
                 conversationId,
+                timestamp: new Date().toISOString()
             });
+            
+            // Update unread count
+            const unreadCount = await getUnreadCount(conversationId, userId);
+            socket.emit('unread_count', { conversationId, count: unreadCount });
+            
         } catch (error) {
             console.error('Error marking as read:', error);
+        }
+    });
+    
+    // ---------- GET UNREAD COUNT ----------
+    socket.on('get_unread', async ({ conversationId }) => {
+        try {
+            const count = await getUnreadCount(conversationId, userId);
+            socket.emit('unread_count', { conversationId, count });
+        } catch (error) {
+            console.error('Error getting unread count:', error);
         }
     });
     
     // ---------- DISCONNECT ----------
     socket.on('disconnect', () => {
         console.log(`🔴 User disconnected: ${userId}`);
+        console.log(`📊 Active connections: ${io.engine.clientsCount}`);
         
         // Remove from active users
         activeUsers.delete(userId);
+        userSockets.delete(socket.id);
         
         // Broadcast offline status
-        io.emit('user_offline', { userId, userName, status: 'offline' });
+        io.emit('user_offline', { 
+            userId, 
+            userName, 
+            status: 'offline',
+            timestamp: new Date().toISOString()
+        });
     });
 });
 
@@ -195,7 +295,7 @@ async function getChatHistory(conversationId, limit = 50, offset = 0) {
     
     return rows.reverse().map(row => ({
         ...row,
-        createdAt: row.createdAt.toISOString(),
+        createdAt: row.createdAt ? row.createdAt.toISOString() : null
     }));
 }
 
@@ -223,12 +323,12 @@ async function saveMessage({ conversationId, senderId, content, messageType }) {
     
     return {
         ...rows[0],
-        createdAt: rows[0].createdAt.toISOString(),
+        createdAt: rows[0].createdAt ? rows[0].createdAt.toISOString() : new Date().toISOString()
     };
 }
 
 async function markMessagesAsRead(conversationId, userId) {
-    await pool.query(
+    const [result] = await pool.query(
         `UPDATE messages 
         SET is_read = 1, read_at = NOW()
         WHERE conversation_id = ? 
@@ -236,6 +336,7 @@ async function markMessagesAsRead(conversationId, userId) {
         AND is_read = 0`,
         [conversationId, userId]
     );
+    return result.affectedRows;
 }
 
 async function updateConversationTimestamp(conversationId) {
@@ -247,16 +348,40 @@ async function updateConversationTimestamp(conversationId) {
     );
 }
 
+async function getUnreadCount(conversationId, userId) {
+    const [rows] = await pool.query(
+        `SELECT COUNT(*) as count 
+        FROM messages 
+        WHERE conversation_id = ? 
+        AND sender_id != ?
+        AND is_read = 0`,
+        [conversationId, userId]
+    );
+    return rows[0].count;
+}
+
 // ---------- START SERVER ----------
 
 const PORT = process.env.PORT || 3000;
 
 async function startServer() {
-    await testConnection();
+    // Test database connection first
+    console.log('📊 Testing database connection...');
+    const connected = await testConnection();
+    
+    if (!connected) {
+        console.error('⚠️  Database connection failed. The server will still start but may not work properly.');
+        console.error('📋 Please check your environment variables and database credentials.');
+    } else {
+        console.log('✅ Database connection established successfully.');
+    }
     
     server.listen(PORT, '0.0.0.0', () => {
         console.log(`🚀 WebSocket server running on port ${PORT}`);
         console.log(`📡 Socket.io ready for connections`);
+        console.log(`🔗 Health check: https://${process.env.RENDER_EXTERNAL_HOSTNAME || 'localhost'}/health`);
+        console.log(`🔗 WebSocket endpoint: wss://${process.env.RENDER_EXTERNAL_HOSTNAME || 'localhost'}`);
+        console.log(`📊 Active users tracking: ${activeUsers.size}`);
     });
 }
 
@@ -264,11 +389,18 @@ startServer().catch(console.error);
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
-    console.log('Shutting down gracefully...');
+    console.log('🛑 Shutting down gracefully...');
     server.close(() => {
+        console.log('📊 Closing database connections...');
         pool.end();
+        console.log('✅ Shutdown complete');
         process.exit(0);
     });
 });
 
-module.exports = { io, server };
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+    console.error('💥 Uncaught Exception:', error);
+});
+
+module.exports = { io, server, app };
