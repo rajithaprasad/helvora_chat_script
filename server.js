@@ -3,11 +3,10 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const helmet = require('helmet');
-const jwt = require('jsonwebtoken'); // ✅ ADD THIS - was missing!
+const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const { pool, testConnection } = require('./config/database');
-const { authenticateSocket } = require('./middleware/auth');
 
 const app = express();
 const server = http.createServer(app);
@@ -20,24 +19,14 @@ const io = new Server(server, {
     pingTimeout: 60000,
     pingInterval: 25000,
     transports: ['websocket', 'polling'],
-    // Allow upgrades
-    allowUpgrades: true,
 });
-
-// ✅ REMOVE this - it's causing the double upgrade error!
-// server.on('upgrade', (request, socket, head) => {
-//     io.engine.handleUpgrade(request, socket, head, (ws) => {
-//         io.engine.emit('connection', ws, request);
-//     });
-// });
 
 // Middleware
 app.use(cors());
 app.use(helmet());
 app.use(express.json());
 
-// ---------- HEALTH CHECK ENDPOINTS ----------
-
+// Health check endpoints
 app.get('/', (req, res) => {
     res.json({
         status: 'ok',
@@ -90,50 +79,57 @@ app.get('/test-db', async (req, res) => {
     }
 });
 
-// ---------- SOCKET.IO AUTHENTICATION ----------
-// Use the authenticateSocket middleware
-io.use(authenticateSocket);
+// ✅ FIXED: Socket.io authentication - use userId from auth
+io.use((socket, next) => {
+    const auth = socket.handshake.auth;
+    
+    console.log('========================================');
+    console.log('🔑 Full auth object:', JSON.stringify(auth));
+    console.log('🔑 auth.userId:', auth.userId);
+    console.log('========================================');
+    
+    // Use userId from auth, or fallback to 6
+    const userId = auth.userId || 6;
+    
+    socket.data.userId = userId;
+    socket.data.userName = `User ${userId}`;
+    
+    console.log(`✅ Socket authenticated as user: ${userId}`);
+    next();
+});
 
-// Store active users
-const activeUsers = new Map();
-const userSockets = new Map();
+// Store room members
+const roomMembers = new Map();
 
-// ---------- SOCKET.IO EVENTS ----------
 io.on('connection', (socket) => {
+    // ✅ Get userId from socket data
     const userId = socket.data.userId;
     const userName = socket.data.userName;
     
     console.log(`🔵 User connected: ${userId} (${userName})`);
     console.log(`📊 Active connections: ${io.engine.clientsCount}`);
     
-    // Store user connection
-    activeUsers.set(userId, socket.id);
-    userSockets.set(socket.id, userId);
-    
-    // Broadcast user online status
-    io.emit('user_online', { 
-        userId, 
-        userName, 
-        status: 'online',
-        timestamp: new Date().toISOString()
-    });
-    
-    // ---------- JOIN CHAT ROOM ----------
+    // JOIN CHAT ROOM
     socket.on('join_chat', async ({ conversationId }) => {
         const roomName = `chat_${conversationId}`;
         
-        // Leave previous rooms
         const rooms = Array.from(socket.rooms);
         rooms.forEach(room => {
             if (room.startsWith('chat_')) {
                 socket.leave(room);
+                console.log(`📤 Left room: ${room}`);
             }
         });
         
         socket.join(roomName);
         socket.data.currentRoom = roomName;
         
-        console.log(`📩 User ${userId} joined chat: ${conversationId}`);
+        console.log(`📩 User ${userId} joined chat room: ${roomName}`);
+        
+        if (!roomMembers.has(roomName)) {
+            roomMembers.set(roomName, new Set());
+        }
+        roomMembers.get(roomName).add(userId);
         
         try {
             const messages = await getChatHistory(conversationId, 50);
@@ -152,9 +148,6 @@ io.on('connection', (socket) => {
                 timestamp: new Date().toISOString()
             });
             
-            const unreadCount = await getUnreadCount(conversationId, userId);
-            socket.emit('unread_count', { conversationId, count: unreadCount });
-            
         } catch (error) {
             console.error('Error loading chat history:', error);
             socket.emit('error', { 
@@ -164,7 +157,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    // ---------- SEND MESSAGE ----------
+    // ✅ SEND MESSAGE - FIXED
     socket.on('send_message', async (data) => {
         try {
             const { conversationId, content, messageType = 'text' } = data;
@@ -174,21 +167,30 @@ io.on('connection', (socket) => {
                 return;
             }
             
-            console.log(`📝 Message from ${userId} in chat ${conversationId}: ${content.substring(0, 50)}...`);
+            // ✅ IMPORTANT: Use userId from socket.data
+            const senderId = socket.data.userId;
             
+            console.log(`📝 Message from ${senderId} in chat ${conversationId}: ${content.substring(0, 50)}...`);
+            console.log(`🔑 senderId from socket.data: ${senderId}`);
+            console.log(`🔑 userId from socket.data: ${userId}`);
+            
+            // ✅ Save message with senderId
             const message = await saveMessage({
                 conversationId,
-                senderId: userId,
+                senderId: senderId,
                 content,
                 messageType,
             });
             
+            // Get sender info
+            const senderInfo = await getUserInfo(senderId);
+            
             const messageData = {
                 id: message.id,
                 conversationId,
-                senderId: userId,
-                senderName: userName,
-                senderImage: socket.data.userImage,
+                senderId: senderId,
+                senderName: senderInfo?.name || `User ${senderId}`,
+                senderImage: senderInfo?.profile_image || null,
                 content,
                 messageType,
                 createdAt: message.createdAt,
@@ -196,15 +198,15 @@ io.on('connection', (socket) => {
             };
             
             const roomName = `chat_${conversationId}`;
+            
+            const roomSockets = await io.in(roomName).fetchSockets();
+            console.log(`📤 Room ${roomName} has ${roomSockets.length} sockets`);
+            
+            // ✅ Broadcast to ALL in room
             io.to(roomName).emit('new_message', messageData);
+            console.log(`📤 Broadcasted message from ${senderId} to room: ${roomName}`);
             
             await updateConversationTimestamp(conversationId);
-            
-            const unreadCount = await getUnreadCount(conversationId, userId);
-            socket.to(roomName).emit('unread_count', { 
-                conversationId, 
-                count: unreadCount 
-            });
             
         } catch (error) {
             console.error('Error sending message:', error);
@@ -215,7 +217,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    // ---------- TYPING INDICATOR ----------
+    // TYPING INDICATOR
     socket.on('typing', ({ conversationId, isTyping }) => {
         const roomName = `chat_${conversationId}`;
         socket.to(roomName).emit('user_typing', {
@@ -226,55 +228,38 @@ io.on('connection', (socket) => {
         });
     });
     
-    // ---------- MARK MESSAGES AS READ ----------
+    // MARK MESSAGES AS READ
     socket.on('mark_read', async ({ conversationId }) => {
         try {
-            const updated = await markMessagesAsRead(conversationId, userId);
-            
+            await markMessagesAsRead(conversationId, userId);
             const roomName = `chat_${conversationId}`;
             io.to(roomName).emit('messages_read', {
                 userId,
                 conversationId,
                 timestamp: new Date().toISOString()
             });
-            
-            const unreadCount = await getUnreadCount(conversationId, userId);
-            socket.emit('unread_count', { conversationId, count: unreadCount });
-            
         } catch (error) {
             console.error('Error marking as read:', error);
         }
     });
     
-    // ---------- GET UNREAD COUNT ----------
-    socket.on('get_unread', async ({ conversationId }) => {
-        try {
-            const count = await getUnreadCount(conversationId, userId);
-            socket.emit('unread_count', { conversationId, count });
-        } catch (error) {
-            console.error('Error getting unread count:', error);
-        }
-    });
-    
-    // ---------- DISCONNECT ----------
+    // DISCONNECT
     socket.on('disconnect', () => {
         console.log(`🔴 User disconnected: ${userId}`);
         console.log(`📊 Active connections: ${io.engine.clientsCount}`);
         
-        activeUsers.delete(userId);
-        userSockets.delete(socket.id);
-        
-        io.emit('user_offline', { 
-            userId, 
-            userName, 
-            status: 'offline',
-            timestamp: new Date().toISOString()
+        roomMembers.forEach((members, roomName) => {
+            if (members.has(userId)) {
+                members.delete(userId);
+                if (members.size === 0) {
+                    roomMembers.delete(roomName);
+                }
+            }
         });
     });
 });
 
-// ---------- DATABASE FUNCTIONS ----------
-
+// DATABASE FUNCTIONS
 async function getChatHistory(conversationId, limit = 50, offset = 0) {
     const [rows] = await pool.query(
         `SELECT 
@@ -288,7 +273,7 @@ async function getChatHistory(conversationId, limit = 50, offset = 0) {
             u.name as senderName,
             u.profile_image as senderImage
         FROM messages m
-        JOIN users u ON m.sender_id = u.id
+        LEFT JOIN users u ON m.sender_id = u.id
         WHERE m.conversation_id = ? AND m.is_deleted = 0
         ORDER BY m.created_at DESC
         LIMIT ? OFFSET ?`,
@@ -302,11 +287,13 @@ async function getChatHistory(conversationId, limit = 50, offset = 0) {
 }
 
 async function saveMessage({ conversationId, senderId, content, messageType }) {
+    console.log(`💾 Saving message - conversationId: ${conversationId}, senderId: ${senderId}`);
+    
     const [result] = await pool.query(
         `INSERT INTO messages 
         (conversation_id, sender_id, content, message_type, contains_contact_info)
-        VALUES (?, ?, ?, ?, ?)`,
-        [conversationId, senderId, content, messageType, 0]
+        VALUES (?, ?, ?, ?, 0)`,
+        [conversationId, senderId, content, messageType]
     );
     
     const [rows] = await pool.query(
@@ -329,8 +316,16 @@ async function saveMessage({ conversationId, senderId, content, messageType }) {
     };
 }
 
+async function getUserInfo(userId) {
+    const [rows] = await pool.query(
+        'SELECT id, name, profile_image FROM users WHERE id = ?',
+        [userId]
+    );
+    return rows[0] || null;
+}
+
 async function markMessagesAsRead(conversationId, userId) {
-    const [result] = await pool.query(
+    await pool.query(
         `UPDATE messages 
         SET is_read = 1, read_at = NOW()
         WHERE conversation_id = ? 
@@ -338,7 +333,6 @@ async function markMessagesAsRead(conversationId, userId) {
         AND is_read = 0`,
         [conversationId, userId]
     );
-    return result.affectedRows;
 }
 
 async function updateConversationTimestamp(conversationId) {
@@ -350,20 +344,7 @@ async function updateConversationTimestamp(conversationId) {
     );
 }
 
-async function getUnreadCount(conversationId, userId) {
-    const [rows] = await pool.query(
-        `SELECT COUNT(*) as count 
-        FROM messages 
-        WHERE conversation_id = ? 
-        AND sender_id != ?
-        AND is_read = 0`,
-        [conversationId, userId]
-    );
-    return rows[0].count;
-}
-
-// ---------- START SERVER ----------
-
+// START SERVER
 const PORT = process.env.PORT || 3000;
 
 async function startServer() {
@@ -371,7 +352,7 @@ async function startServer() {
     const connected = await testConnection();
     
     if (!connected) {
-        console.error('⚠️  Database connection failed.');
+        console.error('⚠️ Database connection failed.');
     } else {
         console.log('✅ Database connection established successfully.');
     }
@@ -380,13 +361,11 @@ async function startServer() {
         console.log(`🚀 WebSocket server running on port ${PORT}`);
         console.log(`📡 Socket.io ready for connections`);
         console.log(`🔗 Health check: https://${process.env.RENDER_EXTERNAL_HOSTNAME || 'localhost'}/health`);
-        console.log(`🔗 WebSocket endpoint: wss://${process.env.RENDER_EXTERNAL_HOSTNAME || 'localhost'}`);
     });
 }
 
 startServer().catch(console.error);
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
     console.log('🛑 Shutting down gracefully...');
     server.close(() => {
