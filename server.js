@@ -79,7 +79,7 @@ app.get('/test-db', async (req, res) => {
     }
 });
 
-// ✅ FIXED: Socket.io authentication - use userId from auth
+// ✅ Socket.io authentication - use userId from auth
 io.use((socket, next) => {
     const auth = socket.handshake.auth;
     
@@ -88,7 +88,6 @@ io.use((socket, next) => {
     console.log('🔑 auth.userId:', auth.userId);
     console.log('========================================');
     
-    // Use userId from auth, or fallback to 6
     const userId = auth.userId || 6;
     
     socket.data.userId = userId;
@@ -102,7 +101,6 @@ io.use((socket, next) => {
 const roomMembers = new Map();
 
 io.on('connection', (socket) => {
-    // ✅ Get userId from socket data
     const userId = socket.data.userId;
     const userName = socket.data.userName;
     
@@ -157,7 +155,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    // ✅ SEND MESSAGE - FIXED
+    // ✅ SEND MESSAGE
     socket.on('send_message', async (data) => {
         try {
             const { conversationId, content, messageType = 'text' } = data;
@@ -167,14 +165,12 @@ io.on('connection', (socket) => {
                 return;
             }
             
-            // ✅ IMPORTANT: Use userId from socket.data
             const senderId = socket.data.userId;
             
             console.log(`📝 Message from ${senderId} in chat ${conversationId}: ${content.substring(0, 50)}...`);
             console.log(`🔑 senderId from socket.data: ${senderId}`);
             console.log(`🔑 userId from socket.data: ${userId}`);
             
-            // ✅ Save message with senderId
             const message = await saveMessage({
                 conversationId,
                 senderId: senderId,
@@ -182,7 +178,6 @@ io.on('connection', (socket) => {
                 messageType,
             });
             
-            // Get sender info
             const senderInfo = await getUserInfo(senderId);
             
             const messageData = {
@@ -202,7 +197,6 @@ io.on('connection', (socket) => {
             const roomSockets = await io.in(roomName).fetchSockets();
             console.log(`📤 Room ${roomName} has ${roomSockets.length} sockets`);
             
-            // ✅ Broadcast to ALL in room
             io.to(roomName).emit('new_message', messageData);
             console.log(`📤 Broadcasted message from ${senderId} to room: ${roomName}`);
             
@@ -212,6 +206,62 @@ io.on('connection', (socket) => {
             console.error('Error sending message:', error);
             socket.emit('error', { 
                 message: 'Failed to send message',
+                details: error.message 
+            });
+        }
+    });
+    
+    // ✅ SEND OFFER - Real-time offer delivery
+    socket.on('send_offer', async (data) => {
+        try {
+            const { conversationId, offerData } = data;
+            
+            if (!conversationId || !offerData) {
+                socket.emit('error', { message: 'Missing required fields' });
+                return;
+            }
+            
+            const senderId = socket.data.userId;
+            
+            console.log(`📝 Offer from ${senderId} in chat ${conversationId}: ${offerData.service_name}`);
+            
+            // Save offer message to database with type 'offer'
+            const message = await saveMessage({
+                conversationId,
+                senderId: senderId,
+                content: JSON.stringify(offerData),
+                messageType: 'offer',
+            });
+            
+            const senderInfo = await getUserInfo(senderId);
+            
+            const messageData = {
+                id: message.id,
+                conversationId,
+                senderId: senderId,
+                senderName: senderInfo?.name || `User ${senderId}`,
+                senderImage: senderInfo?.profile_image || null,
+                content: JSON.stringify(offerData),
+                messageType: 'offer',
+                createdAt: message.createdAt,
+                is_read: 0,
+            };
+            
+            const roomName = `chat_${conversationId}`;
+            
+            const roomSockets = await io.in(roomName).fetchSockets();
+            console.log(`📤 Room ${roomName} has ${roomSockets.length} sockets`);
+            console.log(`📤 Broadcasting offer to room: ${roomName}`);
+            
+            // ✅ Broadcast to ALL in room including sender
+            io.to(roomName).emit('new_message', messageData);
+            
+            await updateConversationTimestamp(conversationId);
+            
+        } catch (error) {
+            console.error('Error sending offer:', error);
+            socket.emit('error', { 
+                message: 'Failed to send offer',
                 details: error.message 
             });
         }
@@ -287,7 +337,7 @@ async function getChatHistory(conversationId, limit = 50, offset = 0) {
 }
 
 async function saveMessage({ conversationId, senderId, content, messageType }) {
-    console.log(`💾 Saving message - conversationId: ${conversationId}, senderId: ${senderId}`);
+    console.log(`💾 Saving message - conversationId: ${conversationId}, senderId: ${senderId}, type: ${messageType}`);
     
     const [result] = await pool.query(
         `INSERT INTO messages 
