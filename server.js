@@ -211,36 +211,6 @@ io.on('connection', (socket) => {
         }
     });
     
-    // ✅ SEND IMAGE - Real-time image delivery
-    socket.on('send_image', async (data) => {
-        try {
-            const { conversationId, messageData } = data;
-            
-            if (!conversationId || !messageData) {
-                socket.emit('error', { message: 'Missing required fields' });
-                return;
-            }
-            
-            const roomName = `chat_${conversationId}`;
-            
-            const roomSockets = await io.in(roomName).fetchSockets();
-            console.log(`📤 Room ${roomName} has ${roomSockets.length} sockets`);
-            console.log(`📤 Broadcasting image to room: ${roomName}`);
-            
-            // ✅ Broadcast image to ALL in room including sender
-            io.to(roomName).emit('new_message', messageData);
-            
-            await updateConversationTimestamp(conversationId);
-            
-        } catch (error) {
-            console.error('Error sending image:', error);
-            socket.emit('error', { 
-                message: 'Failed to send image',
-                details: error.message 
-            });
-        }
-    });
-    
     // ✅ SEND OFFER - Real-time offer delivery
     socket.on('send_offer', async (data) => {
         try {
@@ -283,6 +253,7 @@ io.on('connection', (socket) => {
             console.log(`📤 Room ${roomName} has ${roomSockets.length} sockets`);
             console.log(`📤 Broadcasting offer to room: ${roomName}`);
             
+            // ✅ Broadcast to ALL in room including sender
             io.to(roomName).emit('new_message', messageData);
             
             await updateConversationTimestamp(conversationId);
