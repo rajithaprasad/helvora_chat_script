@@ -156,88 +156,101 @@ io.on('connection', (socket) => {
     });
     
     // ✅ SEND MESSAGE - With attachment support
-    socket.on('send_message', async (data) => {
-        try {
-            const { conversationId, content, messageType = 'text', attachment_id } = data;
-            
-            if (!conversationId) {
-                socket.emit('error', { message: 'Missing required fields' });
-                return;
-            }
+    // server.js - Update the send_message handler
 
-            const senderId = socket.data.userId;
-
-            // ✅ If attachment_id is provided, fetch attachment details
-            let attachment = null;
-            if (attachment_id) {
-                const [rows] = await pool.query(
-                    'SELECT * FROM message_attachments WHERE id = ?',
-                    [attachment_id]
-                );
-                if (rows.length > 0) {
-                    attachment = rows[0];
-                }
-            }
-
-            // ✅ Save message with attachment info
-            const message = await saveMessage({
-                conversationId,
-                senderId: senderId,
-                content: content || (attachment ? `📎 ${attachment.is_image ? 'Image' : 'File'}: ${attachment.file_name}` : ''),
-                messageType: attachment ? 'file' : messageType,
-            });
-
-            // ✅ Link attachment to message
-            if (attachment && attachment_id) {
-                await pool.query(
-                    'UPDATE message_attachments SET message_id = ? WHERE id = ?',
-                    [message.id, attachment_id]
-                );
-                
-                // ✅ Get the updated attachment with message_id
-                const [updatedAttachment] = await pool.query(
-                    'SELECT * FROM message_attachments WHERE id = ?',
-                    [attachment_id]
-                );
-                if (updatedAttachment.length > 0) {
-                    attachment = updatedAttachment[0];
-                }
-            }
-
-            const senderInfo = await getUserInfo(senderId);
-
-            const messageData = {
-                id: message.id,
-                conversationId,
-                senderId: senderId,
-                senderName: senderInfo?.name || `User ${senderId}`,
-                senderImage: senderInfo?.profile_image || null,
-                content: message.content,
-                messageType: attachment ? 'file' : messageType,
-                createdAt: message.createdAt,
-                is_read: 0,
-                attachments: attachment ? [attachment] : [],
-            };
-
-            const roomName = `chat_${conversationId}`;
-            
-            const roomSockets = await io.in(roomName).fetchSockets();
-            console.log(`📤 Room ${roomName} has ${roomSockets.length} sockets`);
-            console.log(`📤 Broadcasting message with ${messageData.attachments.length} attachments from ${senderId}`);
-
-            io.to(roomName).emit('new_message', messageData);
-            console.log(`📤 Broadcasted message from ${senderId} to room: ${roomName}`);
-
-            await updateConversationTimestamp(conversationId);
-
-        } catch (error) {
-            console.error('Error sending message:', error);
-            socket.emit('error', { 
-                message: 'Failed to send message',
-                details: error.message 
-            });
+// ✅ SEND MESSAGE - With attachment support
+socket.on('send_message', async (data) => {
+    try {
+        const { conversationId, content, messageType = 'text', attachment_id } = data;
+        
+        if (!conversationId) {
+            socket.emit('error', { message: 'Missing required fields' });
+            return;
         }
-    });
+
+        const senderId = socket.data.userId;
+
+        // ✅ If attachment_id is provided, fetch attachment details
+        let attachment = null;
+        if (attachment_id) {
+            const [rows] = await pool.query(
+                'SELECT * FROM message_attachments WHERE id = ?',
+                [attachment_id]
+            );
+            if (rows.length > 0) {
+                attachment = rows[0];
+            }
+        }
+
+        // ✅ Determine content and message type
+        let finalContent = content;
+        let finalMessageType = messageType;
+
+        if (attachment) {
+            finalMessageType = 'file';
+            
+            // ✅ For images: show NO text, just the image
+            if (attachment.is_image) {
+                finalContent = ''; // Empty content - just show the image
+            } else {
+                // ✅ For files: show file name
+                finalContent = `📎 ${attachment.file_name}`;
+            }
+        }
+
+        // ✅ Save message
+        const message = await saveMessage({
+            conversationId,
+            senderId: senderId,
+            content: finalContent,
+            messageType: finalMessageType,
+        });
+
+        // ✅ Link attachment to message
+        if (attachment && attachment_id) {
+            await pool.query(
+                'UPDATE message_attachments SET message_id = ? WHERE id = ?',
+                [message.id, attachment_id]
+            );
+            
+            const [updatedAttachment] = await pool.query(
+                'SELECT * FROM message_attachments WHERE id = ?',
+                [attachment_id]
+            );
+            if (updatedAttachment.length > 0) {
+                attachment = updatedAttachment[0];
+            }
+        }
+
+        const senderInfo = await getUserInfo(senderId);
+
+        const messageData = {
+            id: message.id,
+            conversationId,
+            senderId: senderId,
+            senderName: senderInfo?.name || `User ${senderId}`,
+            senderImage: senderInfo?.profile_image || null,
+            content: finalContent,
+            messageType: finalMessageType,
+            createdAt: message.createdAt,
+            is_read: 0,
+            attachments: attachment ? [attachment] : [],
+        };
+
+        const roomName = `chat_${conversationId}`;
+        io.to(roomName).emit('new_message', messageData);
+        console.log(`📤 Broadcasted message from ${senderId} to room: ${roomName}`);
+
+        await updateConversationTimestamp(conversationId);
+
+    } catch (error) {
+        console.error('Error sending message:', error);
+        socket.emit('error', { 
+            message: 'Failed to send message',
+            details: error.message 
+        });
+    }
+});
     
     // SEND OFFER
     socket.on('send_offer', async (data) => {
