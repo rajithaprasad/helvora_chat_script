@@ -188,23 +188,24 @@ io.on('connection', (socket) => {
             }
 
             // ✅ Determine content and message type
-            let finalContent = content || '';
-            let finalMessageType = messageType;
+            let finalContent = '';
+            let finalMessageType = 'text';
 
             if (attachment) {
                 finalMessageType = 'file';
                 
-                // ✅ For images: show NO text, just the image
+                // ✅ For images: NO text at all
                 if (attachment.is_image) {
-                    finalContent = ''; // ✅ Empty content - just show the image
-                    console.log('📸 Image message - no text content');
+                    finalContent = ''; // ✅ Completely empty for images
+                    console.log('📸 Image message - no text');
                 } else {
-                    // ✅ For files: show file name with emoji
+                    // ✅ For files: show file name
                     finalContent = `📎 ${attachment.file_name}`;
                     console.log(`📎 File message: ${finalContent}`);
                 }
-            } else {
-                console.log(`📝 Text message: "${content}"`);
+            } else if (content) {
+                finalContent = content;
+                finalMessageType = messageType;
             }
 
             // ✅ Save message
@@ -223,7 +224,6 @@ io.on('connection', (socket) => {
                     [message.id, attachment_id]
                 );
                 
-                // ✅ Get updated attachment
                 const [updatedAttachment] = await pool.query(
                     'SELECT * FROM message_attachments WHERE id = ?',
                     [attachment_id]
@@ -359,7 +359,7 @@ io.on('connection', (socket) => {
     });
 });
 
-// DATABASE FUNCTIONS
+// ✅ DATABASE FUNCTIONS
 async function getChatHistory(conversationId, limit = 50, offset = 0) {
     const [rows] = await pool.query(
         `SELECT 
@@ -382,6 +382,7 @@ async function getChatHistory(conversationId, limit = 50, offset = 0) {
     
     const messages = [];
     for (const row of rows.reverse()) {
+        // ✅ Always fetch attachments for every message
         const [attachments] = await pool.query(
             `SELECT 
                 id,
