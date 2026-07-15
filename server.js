@@ -196,12 +196,13 @@ io.on('connection', (socket) => {
                 
                 // ✅ For images: show NO text, just the image
                 if (attachment.is_image) {
-                    finalContent = ''; // Empty content - just show the image
+                    finalContent = ''; // ✅ Empty content - just show the image
+                    console.log('📸 Image message - no text content');
                 } else {
-                    // ✅ For files: show file name
+                    // ✅ For files: show file name with emoji
                     finalContent = `📎 ${attachment.file_name}`;
+                    console.log(`📎 File message: ${finalContent}`);
                 }
-                console.log(`📝 Final content: "${finalContent}", type: ${finalMessageType}`);
             } else {
                 console.log(`📝 Text message: "${content}"`);
             }
@@ -222,6 +223,7 @@ io.on('connection', (socket) => {
                     [message.id, attachment_id]
                 );
                 
+                // ✅ Get updated attachment
                 const [updatedAttachment] = await pool.query(
                     'SELECT * FROM message_attachments WHERE id = ?',
                     [attachment_id]
@@ -246,7 +248,7 @@ io.on('connection', (socket) => {
                 attachments: attachment ? [attachment] : [],
             };
 
-            console.log(`📤 Broadcasting message: ${JSON.stringify(messageData)}`);
+            console.log(`📤 Broadcasting message with ${messageData.attachments.length} attachments`);
 
             const roomName = `chat_${conversationId}`;
             
@@ -303,12 +305,7 @@ io.on('connection', (socket) => {
             };
             
             const roomName = `chat_${conversationId}`;
-            
-            const roomSockets = await io.in(roomName).fetchSockets();
-            console.log(`📤 Room ${roomName} has ${roomSockets.length} sockets`);
-            
             io.to(roomName).emit('new_message', messageData);
-            
             await updateConversationTimestamp(conversationId);
             
         } catch (error) {
