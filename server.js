@@ -79,7 +79,7 @@ app.get('/test-db', async (req, res) => {
     }
 });
 
-// ✅ Socket.io authentication - use userId from auth
+// Socket.io authentication
 io.use((socket, next) => {
     const auth = socket.handshake.auth;
     
@@ -155,53 +155,81 @@ io.on('connection', (socket) => {
         }
     });
     
-    // ✅ SEND MESSAGE
+    // ✅ SEND MESSAGE - With attachment support
     socket.on('send_message', async (data) => {
         try {
-            const { conversationId, content, messageType = 'text' } = data;
+            const { conversationId, content, messageType = 'text', attachment_id } = data;
             
-            if (!content || !conversationId) {
+            if (!conversationId) {
                 socket.emit('error', { message: 'Missing required fields' });
                 return;
             }
-            
+
             const senderId = socket.data.userId;
-            
-            console.log(`📝 Message from ${senderId} in chat ${conversationId}: ${content.substring(0, 50)}...`);
-            console.log(`🔑 senderId from socket.data: ${senderId}`);
-            console.log(`🔑 userId from socket.data: ${userId}`);
-            
+
+            // ✅ If attachment_id is provided, fetch attachment details
+            let attachment = null;
+            if (attachment_id) {
+                const [rows] = await pool.query(
+                    'SELECT * FROM message_attachments WHERE id = ?',
+                    [attachment_id]
+                );
+                if (rows.length > 0) {
+                    attachment = rows[0];
+                }
+            }
+
+            // ✅ Save message with attachment info
             const message = await saveMessage({
                 conversationId,
                 senderId: senderId,
-                content,
-                messageType,
+                content: content || (attachment ? `📎 ${attachment.is_image ? 'Image' : 'File'}: ${attachment.file_name}` : ''),
+                messageType: attachment ? 'file' : messageType,
             });
-            
+
+            // ✅ Link attachment to message
+            if (attachment && attachment_id) {
+                await pool.query(
+                    'UPDATE message_attachments SET message_id = ? WHERE id = ?',
+                    [message.id, attachment_id]
+                );
+                
+                // ✅ Get the updated attachment with message_id
+                const [updatedAttachment] = await pool.query(
+                    'SELECT * FROM message_attachments WHERE id = ?',
+                    [attachment_id]
+                );
+                if (updatedAttachment.length > 0) {
+                    attachment = updatedAttachment[0];
+                }
+            }
+
             const senderInfo = await getUserInfo(senderId);
-            
+
             const messageData = {
                 id: message.id,
                 conversationId,
                 senderId: senderId,
                 senderName: senderInfo?.name || `User ${senderId}`,
                 senderImage: senderInfo?.profile_image || null,
-                content,
-                messageType,
+                content: message.content,
+                messageType: attachment ? 'file' : messageType,
                 createdAt: message.createdAt,
                 is_read: 0,
+                attachments: attachment ? [attachment] : [],
             };
-            
+
             const roomName = `chat_${conversationId}`;
             
             const roomSockets = await io.in(roomName).fetchSockets();
             console.log(`📤 Room ${roomName} has ${roomSockets.length} sockets`);
-            
+            console.log(`📤 Broadcasting message with ${messageData.attachments.length} attachments from ${senderId}`);
+
             io.to(roomName).emit('new_message', messageData);
             console.log(`📤 Broadcasted message from ${senderId} to room: ${roomName}`);
-            
+
             await updateConversationTimestamp(conversationId);
-            
+
         } catch (error) {
             console.error('Error sending message:', error);
             socket.emit('error', { 
@@ -211,7 +239,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    // ✅ SEND OFFER - Real-time offer delivery
+    // SEND OFFER
     socket.on('send_offer', async (data) => {
         try {
             const { conversationId, offerData } = data;
@@ -225,7 +253,6 @@ io.on('connection', (socket) => {
             
             console.log(`📝 Offer from ${senderId} in chat ${conversationId}: ${offerData.service_name}`);
             
-            // Save offer message to database with type 'offer'
             const message = await saveMessage({
                 conversationId,
                 senderId: senderId,
@@ -253,7 +280,6 @@ io.on('connection', (socket) => {
             console.log(`📤 Room ${roomName} has ${roomSockets.length} sockets`);
             console.log(`📤 Broadcasting offer to room: ${roomName}`);
             
-            // ✅ Broadcast to ALL in room including sender
             io.to(roomName).emit('new_message', messageData);
             
             await updateConversationTimestamp(conversationId);
@@ -311,6 +337,7 @@ io.on('connection', (socket) => {
 
 // DATABASE FUNCTIONS
 async function getChatHistory(conversationId, limit = 50, offset = 0) {
+    // ✅ Get messages with attachments
     const [rows] = await pool.query(
         `SELECT 
             m.id,
@@ -330,10 +357,38 @@ async function getChatHistory(conversationId, limit = 50, offset = 0) {
         [conversationId, limit, offset]
     );
     
-    return rows.reverse().map(row => ({
-        ...row,
-        createdAt: row.createdAt ? row.createdAt.toISOString() : null
-    }));
+    // ✅ Get attachments for each message
+    const messages = [];
+    for (const row of rows.reverse()) {
+        const [attachments] = await pool.query(
+            `SELECT 
+                id,
+                message_id,
+                file_url,
+                file_type,
+                file_size,
+                file_name,
+                mime_type,
+                width,
+                height,
+                is_image,
+                created_at
+            FROM message_attachments 
+            WHERE message_id = ?`,
+            [row.id]
+        );
+        
+        messages.push({
+            ...row,
+            attachments: attachments.map(a => ({
+                ...a,
+                created_at: a.created_at.toISOString()
+            })),
+            createdAt: row.createdAt.toISOString()
+        });
+    }
+    
+    return messages;
 }
 
 async function saveMessage({ conversationId, senderId, content, messageType }) {
