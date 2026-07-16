@@ -155,7 +155,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    // ✅ SEND MESSAGE - With attachment support
+    // ✅ SEND MESSAGE - With attachment support (for text and file messages)
     socket.on('send_message', async (data) => {
         console.log('📨 send_message received:', JSON.stringify(data));
         
@@ -173,6 +173,8 @@ io.on('connection', (socket) => {
 
             // ✅ If attachment_id is provided, fetch attachment details
             let attachment = null;
+            let existingMessageId = null;
+            
             if (attachment_id) {
                 console.log(`📎 Fetching attachment: ${attachment_id}`);
                 const [rows] = await pool.query(
@@ -181,6 +183,11 @@ io.on('connection', (socket) => {
                 );
                 if (rows.length > 0) {
                     attachment = rows[0];
+                    // ✅ Check if attachment already has a message_id
+                    if (attachment.message_id) {
+                        existingMessageId = attachment.message_id;
+                        console.log(`✅ Attachment already linked to message: ${existingMessageId}`);
+                    }
                     console.log(`📎 Attachment found: ${attachment.file_name}, is_image: ${attachment.is_image}`);
                 } else {
                     console.log(`⚠️ Attachment not found: ${attachment_id}`);
@@ -208,32 +215,92 @@ io.on('connection', (socket) => {
                 finalMessageType = messageType;
             }
 
-            // ✅ Save message
-            const message = await saveMessage({
-                conversationId,
-                senderId: senderId,
-                content: finalContent,
-                messageType: finalMessageType,
-            });
-            console.log(`💾 Message saved: ${message.id}`);
+            let message;
+            
+            // ✅ If message already exists (from upload), use it
+            if (existingMessageId) {
+                const [rows] = await pool.query(
+                    `SELECT 
+                        id,
+                        conversation_id as conversationId,
+                        sender_id as senderId,
+                        content,
+                        message_type as messageType,
+                        is_read as isRead,
+                        created_at as createdAt
+                    FROM messages 
+                    WHERE id = ?`,
+                    [existingMessageId]
+                );
+                if (rows.length > 0) {
+                    message = {
+                        id: rows[0].id,
+                        conversationId: rows[0].conversationId,
+                        senderId: rows[0].senderId,
+                        content: rows[0].content,
+                        messageType: rows[0].messageType,
+                        isRead: rows[0].isRead,
+                        createdAt: rows[0].createdAt ? rows[0].createdAt.toISOString() : new Date().toISOString()
+                    };
+                    console.log(`✅ Using existing message: ${message.id}`);
+                }
+            }
+            
+            // ✅ If no existing message, create a new one
+            if (!message) {
+                message = await saveMessage({
+                    conversationId,
+                    senderId: senderId,
+                    content: finalContent,
+                    messageType: finalMessageType,
+                });
+                console.log(`💾 New message saved: ${message.id}`);
 
-            // ✅ Link attachment to message
-            if (attachment && attachment_id) {
-                await pool.query(
-                    'UPDATE message_attachments SET message_id = ? WHERE id = ?',
-                    [message.id, attachment_id]
-                );
-                
-                const [updatedAttachment] = await pool.query(
-                    'SELECT * FROM message_attachments WHERE id = ?',
-                    [attachment_id]
-                );
-                if (updatedAttachment.length > 0) {
-                    attachment = updatedAttachment[0];
+                // ✅ Link attachment to message (only if not already linked)
+                if (attachment && attachment_id) {
+                    await pool.query(
+                        'UPDATE message_attachments SET message_id = ? WHERE id = ? AND message_id IS NULL',
+                        [message.id, attachment_id]
+                    );
+                    
+                    const [updatedAttachment] = await pool.query(
+                        'SELECT * FROM message_attachments WHERE id = ?',
+                        [attachment_id]
+                    );
+                    if (updatedAttachment.length > 0) {
+                        attachment = updatedAttachment[0];
+                    }
                 }
             }
 
             const senderInfo = await getUserInfo(senderId);
+
+            // ✅ Get attachments for the message
+            let attachments = [];
+            if (message.id) {
+                const [attachmentRows] = await pool.query(
+                    `SELECT 
+                        id,
+                        message_id,
+                        file_url,
+                        file_type,
+                        file_size,
+                        file_name,
+                        mime_type,
+                        width,
+                        height,
+                        is_image,
+                        created_at
+                    FROM message_attachments 
+                    WHERE message_id = ?`,
+                    [message.id]
+                );
+                attachments = attachmentRows.map(a => ({
+                    ...a,
+                    is_image: a.is_image === 1,
+                    created_at: a.created_at ? a.created_at.toISOString() : new Date().toISOString()
+                }));
+            }
 
             const messageData = {
                 id: message.id,
@@ -241,11 +308,11 @@ io.on('connection', (socket) => {
                 senderId: senderId,
                 senderName: senderInfo?.name || `User ${senderId}`,
                 senderImage: senderInfo?.profile_image || null,
-                content: finalContent,
-                messageType: finalMessageType,
+                content: message.content || finalContent,
+                messageType: message.messageType || finalMessageType,
                 createdAt: message.createdAt,
                 is_read: 0,
-                attachments: attachment ? [attachment] : [],
+                attachments: attachments,
             };
 
             console.log(`📤 Broadcasting message with ${messageData.attachments.length} attachments`);
@@ -264,6 +331,93 @@ io.on('connection', (socket) => {
             console.error('❌ Error sending message:', error);
             socket.emit('error', { 
                 message: 'Failed to send message',
+                details: error.message 
+            });
+        }
+    });
+    
+    // ✅ NEW: Handle new file uploaded (from mobile app after PHP upload)
+    socket.on('new_file_uploaded', async (data) => {
+        try {
+            const { conversationId, messageId, attachmentId } = data;
+            
+            console.log(`📎 New file uploaded - conversation: ${conversationId}, message: ${messageId}, attachment: ${attachmentId}`);
+            
+            // ✅ Get the message with attachment
+            const [messageRows] = await pool.query(
+                `SELECT 
+                    m.id,
+                    m.conversation_id as conversationId,
+                    m.sender_id as senderId,
+                    m.content,
+                    m.message_type as messageType,
+                    m.is_read as isRead,
+                    m.created_at as createdAt,
+                    u.name as senderName,
+                    u.profile_image as senderImage
+                FROM messages m
+                LEFT JOIN users u ON m.sender_id = u.id
+                WHERE m.id = ?`,
+                [messageId]
+            );
+            
+            if (messageRows.length === 0) {
+                console.log(`⚠️ Message ${messageId} not found`);
+                socket.emit('error', { message: 'Message not found' });
+                return;
+            }
+            
+            const message = messageRows[0];
+            
+            // ✅ Get attachments
+            const [attachments] = await pool.query(
+                `SELECT 
+                    id,
+                    message_id,
+                    file_url,
+                    file_type,
+                    file_size,
+                    file_name,
+                    mime_type,
+                    width,
+                    height,
+                    is_image,
+                    created_at
+                FROM message_attachments 
+                WHERE message_id = ?`,
+                [messageId]
+            );
+            
+            // Format message data
+            const messageData = {
+                id: message.id,
+                conversationId: message.conversationId,
+                senderId: message.senderId,
+                senderName: message.senderName || 'User',
+                senderImage: message.senderImage || null,
+                content: message.content || '',
+                messageType: message.messageType || 'file',
+                isRead: message.isRead || 0,
+                createdAt: message.createdAt ? message.createdAt.toISOString() : new Date().toISOString(),
+                attachments: attachments.map(a => ({
+                    ...a,
+                    is_image: a.is_image === 1,
+                    created_at: a.created_at ? a.created_at.toISOString() : new Date().toISOString()
+                })),
+            };
+            
+            // ✅ Broadcast to room
+            const roomName = `chat_${conversationId}`;
+            io.to(roomName).emit('new_message', messageData);
+            console.log(`📤 Broadcasted file message to room: ${roomName}`);
+            
+            // ✅ Update conversation timestamp
+            await updateConversationTimestamp(conversationId);
+            
+        } catch (error) {
+            console.error('❌ Error handling new file upload:', error);
+            socket.emit('error', { 
+                message: 'Failed to process file upload',
                 details: error.message 
             });
         }
@@ -302,6 +456,7 @@ io.on('connection', (socket) => {
                 messageType: 'offer',
                 createdAt: message.createdAt,
                 is_read: 0,
+                attachments: [],
             };
             
             const roomName = `chat_${conversationId}`;
@@ -405,7 +560,8 @@ async function getChatHistory(conversationId, limit = 50, offset = 0) {
             ...row,
             attachments: attachments.map(a => ({
                 ...a,
-                created_at: a.created_at.toISOString()
+                is_image: a.is_image === 1,
+                created_at: a.created_at ? a.created_at.toISOString() : new Date().toISOString()
             })),
             createdAt: row.createdAt ? row.createdAt.toISOString() : null
         });
