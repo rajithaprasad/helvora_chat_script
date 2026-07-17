@@ -238,7 +238,7 @@ io.on('connection', (socket) => {
                         conversationId: rows[0].conversationId,
                         senderId: rows[0].senderId,
                         content: rows[0].content,
-                        messageType: rows[0].messageType,
+                        messageType: 'file', // ✅ Force to 'file' since it has attachment
                         isRead: rows[0].isRead,
                         createdAt: rows[0].createdAt ? rows[0].createdAt.toISOString() : new Date().toISOString()
                     };
@@ -309,7 +309,7 @@ io.on('connection', (socket) => {
                 senderName: senderInfo?.name || `User ${senderId}`,
                 senderImage: senderInfo?.profile_image || null,
                 content: message.content || finalContent,
-                messageType: message.messageType || finalMessageType,
+                messageType: 'file', // ✅ Force to 'file' if has attachments
                 createdAt: message.createdAt,
                 is_read: 0,
                 attachments: attachments,
@@ -396,7 +396,7 @@ io.on('connection', (socket) => {
                 senderName: message.senderName || 'User',
                 senderImage: message.senderImage || null,
                 content: message.content || '',
-                messageType: message.messageType || 'file',
+                messageType: 'file', // ✅ Force to 'file' since it has attachment
                 isRead: message.isRead || 0,
                 createdAt: message.createdAt ? message.createdAt.toISOString() : new Date().toISOString(),
                 attachments: attachments.map(a => ({
@@ -556,8 +556,15 @@ async function getChatHistory(conversationId, limit = 50, offset = 0) {
             [row.id]
         );
         
+        // ✅ If there are attachments, force messageType to 'file'
+        let messageType = row.messageType;
+        if (attachments.length > 0) {
+            messageType = 'file';
+        }
+        
         messages.push({
             ...row,
+            messageType: messageType,
             attachments: attachments.map(a => ({
                 ...a,
                 is_image: a.is_image === 1,
