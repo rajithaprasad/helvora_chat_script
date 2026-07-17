@@ -423,7 +423,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    // ✅ SEND OFFER - Updated with better handling
+    // ✅ SEND OFFER
     socket.on('send_offer', async (data) => {
         try {
             const { conversationId, offerData } = data;
@@ -470,6 +470,121 @@ io.on('connection', (socket) => {
             console.error('Error sending offer:', error);
             socket.emit('error', { 
                 message: 'Failed to send offer',
+                details: error.message 
+            });
+        }
+    });
+
+    // ✅ Handle offer updated (accepted/declined)
+    socket.on('offer_updated', async (data) => {
+        try {
+            const { conversationId, offerId, status, orderId } = data;
+            
+            console.log(`📋 Offer ${offerId} updated to ${status} in conversation ${conversationId}`);
+            
+            // ✅ Get the updated offer from database
+            const [offerRows] = await pool.query(
+                'SELECT * FROM custom_offers WHERE id = ?',
+                [offerId]
+            );
+            
+            if (offerRows.length === 0) {
+                console.log(`⚠️ Offer ${offerId} not found`);
+                socket.emit('error', { message: 'Offer not found' });
+                return;
+            }
+            
+            const offer = offerRows[0];
+            
+            // ✅ Find the message that contains this offer
+            // The offer message content is JSON with offer_id
+            const [messageRows] = await pool.query(
+                `SELECT * FROM messages 
+                 WHERE conversation_id = ? 
+                 AND message_type = 'offer'
+                 AND content LIKE ?`,
+                [conversationId, `%"offer_id":${offerId}%`]
+            );
+            
+            if (messageRows.length === 0) {
+                console.log(`⚠️ Message for offer ${offerId} not found`);
+                socket.emit('error', { message: 'Message not found' });
+                return;
+            }
+            
+            const message = messageRows[0];
+            
+            // ✅ Update the offer status in the message content
+            let offerData = JSON.parse(message.content);
+            offerData.status = status;
+            if (orderId) {
+                offerData.order_id = orderId;
+            }
+            
+            // ✅ Update the message content
+            await pool.query(
+                'UPDATE messages SET content = ? WHERE id = ?',
+                [JSON.stringify(offerData), message.id]
+            );
+            
+            // ✅ Get sender info
+            const senderInfo = await getUserInfo(message.sender_id);
+            
+            // ✅ Broadcast updated message to room
+            const roomName = `chat_${conversationId}`;
+            const messageData = {
+                id: message.id,
+                conversationId: conversationId,
+                senderId: message.sender_id,
+                senderName: senderInfo?.name || 'User',
+                senderImage: senderInfo?.profile_image || null,
+                content: JSON.stringify(offerData),
+                messageType: 'offer',
+                createdAt: message.created_at ? message.created_at.toISOString() : new Date().toISOString(),
+                is_read: 1,
+                attachments: [],
+            };
+            
+            io.to(roomName).emit('offer_updated', messageData);
+            console.log(`📤 Broadcasted offer update to room: ${roomName}`);
+            
+            // ✅ Also send a system message about the offer status change
+            let statusMessage = '';
+            if (status === 'accepted') {
+                statusMessage = `✅ Offer accepted! Work order #${orderId || 'created'} has been created.`;
+            } else if (status === 'declined') {
+                statusMessage = `❌ Offer declined.`;
+            }
+            
+            if (statusMessage) {
+                const systemMessage = await saveMessage({
+                    conversationId,
+                    senderId: message.sender_id,
+                    content: statusMessage,
+                    messageType: 'text',
+                });
+                
+                const systemMessageData = {
+                    id: systemMessage.id,
+                    conversationId: conversationId,
+                    senderId: systemMessage.senderId,
+                    senderName: 'System',
+                    senderImage: null,
+                    content: statusMessage,
+                    messageType: 'text',
+                    createdAt: systemMessage.createdAt,
+                    is_read: 0,
+                    attachments: [],
+                };
+                
+                io.to(roomName).emit('new_message', systemMessageData);
+                console.log(`📤 Broadcasted system message to room: ${roomName}`);
+            }
+            
+        } catch (error) {
+            console.error('❌ Error handling offer update:', error);
+            socket.emit('error', { 
+                message: 'Failed to update offer',
                 details: error.message 
             });
         }
