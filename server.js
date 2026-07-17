@@ -423,7 +423,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    // SEND OFFER
+    // ✅ SEND OFFER - Updated with better handling
     socket.on('send_offer', async (data) => {
         try {
             const { conversationId, offerData } = data;
@@ -435,8 +435,9 @@ io.on('connection', (socket) => {
             
             const senderId = socket.data.userId;
             
-            console.log(`📝 Offer from ${senderId} in chat ${conversationId}: ${offerData.service_name}`);
+            console.log(`📝 Offer from ${senderId} in chat ${conversationId}:`, offerData);
             
+            // ✅ Save message with offer data as JSON string
             const message = await saveMessage({
                 conversationId,
                 senderId: senderId,
@@ -461,6 +462,8 @@ io.on('connection', (socket) => {
             
             const roomName = `chat_${conversationId}`;
             io.to(roomName).emit('new_message', messageData);
+            console.log(`📤 Broadcasted offer from ${senderId} to room: ${roomName}`);
+            
             await updateConversationTimestamp(conversationId);
             
         } catch (error) {
@@ -558,8 +561,21 @@ async function getChatHistory(conversationId, limit = 50, offset = 0) {
         
         // ✅ If there are attachments, force messageType to 'file'
         let messageType = row.messageType;
-        if (attachments.length > 0) {
+        if (attachments.length > 0 && messageType !== 'offer') {
             messageType = 'file';
+        }
+        
+        // ✅ If content is JSON and looks like an offer, set to 'offer'
+        if (typeof row.content === 'string' && row.content.startsWith('{')) {
+            try {
+                const parsed = JSON.parse(row.content);
+                if (parsed && (parsed.type === 'offer' || parsed.offer_id || parsed.service_name || parsed.seller_name)) {
+                    messageType = 'offer';
+                    console.log(`📋 Detected offer in message ${row.id} from DB`);
+                }
+            } catch (e) {
+                // Not JSON, ignore
+            }
         }
         
         messages.push({
