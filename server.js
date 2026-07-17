@@ -475,7 +475,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    // ✅ Handle offer updated (accepted/declined)
+    // ✅ Handle offer updated (accepted/declined) - With graceful error handling
     socket.on('offer_updated', async (data) => {
         try {
             const { conversationId, offerId, status, orderId } = data;
@@ -490,7 +490,7 @@ io.on('connection', (socket) => {
             
             if (offerRows.length === 0) {
                 console.log(`⚠️ Offer ${offerId} not found`);
-                socket.emit('error', { message: 'Offer not found' });
+                // ✅ Don't send error, just log it
                 return;
             }
             
@@ -538,8 +538,8 @@ io.on('connection', (socket) => {
             }
             
             if (!message) {
-                console.log(`⚠️ No message found for offer ${offerId}`);
-                socket.emit('error', { message: 'Message not found' });
+                console.log(`⚠️ No message found for offer ${offerId}, but offer was updated in DB`);
+                // ✅ Don't send error, just log it and return
                 return;
             }
             
@@ -612,10 +612,8 @@ io.on('connection', (socket) => {
             
         } catch (error) {
             console.error('❌ Error handling offer update:', error);
-            socket.emit('error', { 
-                message: 'Failed to update offer',
-                details: error.message 
-            });
+            // ✅ Don't emit error to client, just log it
+            // The offer was already updated in the database
         }
     });
     
