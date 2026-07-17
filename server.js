@@ -496,8 +496,10 @@ io.on('connection', (socket) => {
             
             const offer = offerRows[0];
             
-            // ✅ Find the message that contains this offer
-            // The offer message content is JSON with offer_id
+            // ✅ Find the message that contains this offer - BETTER QUERY
+            let message = null;
+            
+            // First try: Find by offer_id in content using LIKE
             const [messageRows] = await pool.query(
                 `SELECT * FROM messages 
                  WHERE conversation_id = ? 
@@ -506,13 +508,40 @@ io.on('connection', (socket) => {
                 [conversationId, `%"offer_id":${offerId}%`]
             );
             
-            if (messageRows.length === 0) {
-                console.log(`⚠️ Message for offer ${offerId} not found`);
+            if (messageRows.length > 0) {
+                message = messageRows[0];
+                console.log(`✅ Found message via LIKE query: ${message.id}`);
+            } else {
+                // ✅ Second try: Get all offer messages and parse JSON
+                console.log(`⚠️ No message found with LIKE query, trying JSON parsing...`);
+                const [allOfferMessages] = await pool.query(
+                    `SELECT * FROM messages 
+                     WHERE conversation_id = ? 
+                     AND message_type = 'offer'`,
+                    [conversationId]
+                );
+                
+                for (const msg of allOfferMessages) {
+                    try {
+                        const parsed = JSON.parse(msg.content);
+                        // Check if this message contains the offer_id
+                        if (parsed.offer_id === offerId || parsed.id === offerId) {
+                            message = msg;
+                            console.log(`✅ Found message via JSON parsing: ${message.id}`);
+                            break;
+                        }
+                    } catch (e) {
+                        // Skip invalid JSON
+                        continue;
+                    }
+                }
+            }
+            
+            if (!message) {
+                console.log(`⚠️ No message found for offer ${offerId}`);
                 socket.emit('error', { message: 'Message not found' });
                 return;
             }
-            
-            const message = messageRows[0];
             
             // ✅ Update the offer status in the message content
             let offerData = JSON.parse(message.content);
