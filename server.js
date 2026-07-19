@@ -423,7 +423,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    // ✅ SEND OFFER - Fixed duplicate issue
+    // ✅ SEND OFFER
     socket.on('send_offer', async (data) => {
         try {
             const { conversationId, offerData } = data;
@@ -436,22 +436,6 @@ io.on('connection', (socket) => {
             const senderId = socket.data.userId;
             
             console.log(`📝 Offer from ${senderId} in chat ${conversationId}:`, offerData);
-            
-            // ✅ Check if offer already exists in this conversation (prevent duplicates)
-            const [existingOffers] = await pool.query(
-                `SELECT id FROM messages 
-                 WHERE conversation_id = ? 
-                 AND message_type = 'offer' 
-                 AND sender_id = ?
-                 AND content LIKE ?`,
-                [conversationId, senderId, `%"offer_id":${offerData.offer_id}%`]
-            );
-            
-            if (existingOffers.length > 0) {
-                console.log(`⚠️ Offer ${offerData.offer_id} already exists, skipping duplicate`);
-                socket.emit('error', { message: 'Offer already sent' });
-                return;
-            }
             
             // ✅ Save message with offer data as JSON string
             const message = await saveMessage({
@@ -477,8 +461,6 @@ io.on('connection', (socket) => {
             };
             
             const roomName = `chat_${conversationId}`;
-            
-            // ✅ Broadcast to everyone in the room (including sender)
             io.to(roomName).emit('new_message', messageData);
             console.log(`📤 Broadcasted offer from ${senderId} to room: ${roomName}`);
             
@@ -493,7 +475,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    // ✅ Handle offer updated (accepted/declined)
+    // ✅ Handle offer updated (accepted/declined) - With graceful error handling
     socket.on('offer_updated', async (data) => {
         try {
             const { conversationId, offerId, status, orderId } = data;
@@ -508,12 +490,13 @@ io.on('connection', (socket) => {
             
             if (offerRows.length === 0) {
                 console.log(`⚠️ Offer ${offerId} not found`);
+                // ✅ Don't send error, just log it
                 return;
             }
             
             const offer = offerRows[0];
             
-            // ✅ Find the message that contains this offer
+            // ✅ Find the message that contains this offer - BETTER QUERY
             let message = null;
             
             // First try: Find by offer_id in content using LIKE
@@ -541,12 +524,14 @@ io.on('connection', (socket) => {
                 for (const msg of allOfferMessages) {
                     try {
                         const parsed = JSON.parse(msg.content);
+                        // Check if this message contains the offer_id
                         if (parsed.offer_id === offerId || parsed.id === offerId) {
                             message = msg;
                             console.log(`✅ Found message via JSON parsing: ${message.id}`);
                             break;
                         }
                     } catch (e) {
+                        // Skip invalid JSON
                         continue;
                     }
                 }
@@ -554,6 +539,7 @@ io.on('connection', (socket) => {
             
             if (!message) {
                 console.log(`⚠️ No message found for offer ${offerId}, but offer was updated in DB`);
+                // ✅ Don't send error, just log it and return
                 return;
             }
             
@@ -626,6 +612,8 @@ io.on('connection', (socket) => {
             
         } catch (error) {
             console.error('❌ Error handling offer update:', error);
+            // ✅ Don't emit error to client, just log it
+            // The offer was already updated in the database
         }
     });
     
