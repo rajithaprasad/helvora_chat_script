@@ -423,7 +423,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    // ✅ SEND OFFER - MODIFIED: Don't create another message, just broadcast existing one
+    // ✅ SEND OFFER - FIXED: ONLY BROADCAST, NEVER CREATE
     socket.on('send_offer', async (data) => {
         try {
             const { conversationId, offerData } = data;
@@ -437,79 +437,66 @@ io.on('connection', (socket) => {
             
             console.log(`📝 Offer from ${senderId} in chat ${conversationId}:`, offerData);
             
-            // ✅ Get the sender info
+            // ✅ Get sender info
             const senderInfo = await getUserInfo(senderId);
             
-            // ✅ Check if this offer already exists in the database
+            // ✅ Get the offer ID from the data
             const offerId = offerData.offer_id;
             
-            let message = null;
-            
-            if (offerId) {
-                // ✅ Try to find the existing message
-                const [rows] = await pool.query(
-                    `SELECT 
-                        id,
-                        conversation_id as conversationId,
-                        sender_id as senderId,
-                        content,
-                        message_type as messageType,
-                        is_read as isRead,
-                        created_at as createdAt
-                    FROM messages 
-                    WHERE conversation_id = ? 
-                    AND message_type = 'offer'
-                    AND content LIKE ?`,
-                    [conversationId, `%"offer_id":${offerId}%`]
-                );
-                
-                if (rows.length > 0) {
-                    message = {
-                        id: rows[0].id,
-                        conversationId: rows[0].conversationId,
-                        senderId: rows[0].senderId,
-                        content: rows[0].content,
-                        messageType: 'offer',
-                        isRead: rows[0].isRead,
-                        createdAt: rows[0].createdAt ? rows[0].createdAt.toISOString() : new Date().toISOString()
-                    };
-                    console.log(`✅ Found existing offer message: ${message.id}`);
-                }
+            if (!offerId) {
+                console.error('❌ No offer_id in offerData:', offerData);
+                socket.emit('error', { message: 'Invalid offer data' });
+                return;
             }
             
-            // ✅ If no existing message found, create one (fallback)
-            if (!message) {
-                console.log(`⚠️ No existing message found, creating new one (fallback)`);
-                message = await saveMessage({
-                    conversationId,
-                    senderId: senderId,
-                    content: JSON.stringify(offerData),
-                    messageType: 'offer',
-                });
-                console.log(`💾 New offer message saved: ${message.id}`);
+            // ✅ Find the existing message that contains this offer
+            const [rows] = await pool.query(
+                `SELECT 
+                    id,
+                    conversation_id as conversationId,
+                    sender_id as senderId,
+                    content,
+                    message_type as messageType,
+                    is_read as isRead,
+                    created_at as createdAt
+                FROM messages 
+                WHERE conversation_id = ? 
+                AND message_type = 'offer'
+                AND content LIKE ?`,
+                [conversationId, `%"offer_id":${offerId}%`]
+            );
+            
+            if (rows.length === 0) {
+                console.error(`❌ No message found for offer ${offerId}`);
+                socket.emit('error', { message: 'Offer message not found' });
+                return;
             }
             
+            const message = rows[0];
+            console.log(`✅ Found existing offer message: ${message.id}`);
+            
+            // ✅ Broadcast the existing message
             const messageData = {
                 id: message.id,
                 conversationId: conversationId,
-                senderId: message.senderId || senderId,
-                senderName: senderInfo?.name || `User ${senderId}`,
+                senderId: message.senderId,
+                senderName: senderInfo?.name || `User ${message.senderId}`,
                 senderImage: senderInfo?.profile_image || null,
-                content: message.content || JSON.stringify(offerData),
+                content: message.content,
                 messageType: 'offer',
-                createdAt: message.createdAt || new Date().toISOString(),
+                createdAt: message.createdAt ? message.createdAt.toISOString() : new Date().toISOString(),
                 is_read: 0,
                 attachments: [],
             };
             
             const roomName = `chat_${conversationId}`;
             io.to(roomName).emit('new_message', messageData);
-            console.log(`📤 Broadcasted offer from ${senderId} to room: ${roomName}`);
+            console.log(`📤 Broadcasted offer ${offerId} from ${senderId} to room: ${roomName}`);
             
             await updateConversationTimestamp(conversationId);
             
         } catch (error) {
-            console.error('Error sending offer:', error);
+            console.error('❌ Error sending offer:', error);
             socket.emit('error', { 
                 message: 'Failed to send offer',
                 details: error.message 
