@@ -423,10 +423,11 @@ io.on('connection', (socket) => {
         }
     });
     
-    // ✅ SEND OFFER - FIXED: ONLY BROADCAST, NEVER CREATE
+    // ✅ SEND OFFER - FIXED: Server doesn't create anything, just broadcasts
+    // The client will send the full message data directly
     socket.on('send_offer', async (data) => {
         try {
-            const { conversationId, offerData } = data;
+            const { conversationId, offerData, messageId } = data;
             
             if (!conversationId || !offerData) {
                 socket.emit('error', { message: 'Missing required fields' });
@@ -435,63 +436,28 @@ io.on('connection', (socket) => {
             
             const senderId = socket.data.userId;
             
-            console.log(`📝 Offer from ${senderId} in chat ${conversationId}:`, offerData);
+            console.log(`📝 Offer broadcast from ${senderId} in chat ${conversationId}:`, offerData);
             
             // ✅ Get sender info
             const senderInfo = await getUserInfo(senderId);
             
-            // ✅ Get the offer ID from the data
-            const offerId = offerData.offer_id;
-            
-            if (!offerId) {
-                console.error('❌ No offer_id in offerData:', offerData);
-                socket.emit('error', { message: 'Invalid offer data' });
-                return;
-            }
-            
-            // ✅ Find the existing message that contains this offer
-            const [rows] = await pool.query(
-                `SELECT 
-                    id,
-                    conversation_id as conversationId,
-                    sender_id as senderId,
-                    content,
-                    message_type as messageType,
-                    is_read as isRead,
-                    created_at as createdAt
-                FROM messages 
-                WHERE conversation_id = ? 
-                AND message_type = 'offer'
-                AND content LIKE ?`,
-                [conversationId, `%"offer_id":${offerId}%`]
-            );
-            
-            if (rows.length === 0) {
-                console.error(`❌ No message found for offer ${offerId}`);
-                socket.emit('error', { message: 'Offer message not found' });
-                return;
-            }
-            
-            const message = rows[0];
-            console.log(`✅ Found existing offer message: ${message.id}`);
-            
-            // ✅ Broadcast the existing message
+            // ✅ Create message data for broadcasting
             const messageData = {
-                id: message.id,
+                id: messageId || `temp_${Date.now()}`,
                 conversationId: conversationId,
-                senderId: message.senderId,
-                senderName: senderInfo?.name || `User ${message.senderId}`,
+                senderId: senderId,
+                senderName: senderInfo?.name || `User ${senderId}`,
                 senderImage: senderInfo?.profile_image || null,
-                content: message.content,
+                content: JSON.stringify(offerData),
                 messageType: 'offer',
-                createdAt: message.createdAt ? message.createdAt.toISOString() : new Date().toISOString(),
+                createdAt: new Date().toISOString(),
                 is_read: 0,
                 attachments: [],
             };
             
             const roomName = `chat_${conversationId}`;
             io.to(roomName).emit('new_message', messageData);
-            console.log(`📤 Broadcasted offer ${offerId} from ${senderId} to room: ${roomName}`);
+            console.log(`📤 Broadcasted offer ${offerData.offer_id} from ${senderId} to room: ${roomName}`);
             
             await updateConversationTimestamp(conversationId);
             
