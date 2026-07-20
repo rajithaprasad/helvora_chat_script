@@ -107,8 +107,8 @@ io.on('connection', (socket) => {
     console.log(`🔵 User connected: ${userId} (${userName})`);
     console.log(`📊 Active connections: ${io.engine.clientsCount}`);
     
-    // ✅ JOIN CHAT ROOM - MODIFIED: Don't send chat_history
-    socket.on('join_chat', async ({ conversationId, skipHistory = false }) => {
+    // JOIN CHAT ROOM
+    socket.on('join_chat', async ({ conversationId }) => {
         const roomName = `chat_${conversationId}`;
         
         const rooms = Array.from(socket.rooms);
@@ -130,21 +130,13 @@ io.on('connection', (socket) => {
         roomMembers.get(roomName).add(userId);
         
         try {
-            // ✅ ONLY send chat_history if skipHistory is false AND we're not already loaded
-            // We'll let the client load via REST API instead
-            if (!skipHistory) {
-                // ✅ Still send chat_history for backward compatibility, but client should use REST
-                const messages = await getChatHistory(conversationId, 50);
-                socket.emit('chat_history', {
-                    conversationId,
-                    messages,
-                    hasMore: messages.length === 50,
-                    timestamp: new Date().toISOString()
-                });
-                console.log(`📤 Sent chat history (${messages.length} messages) - client will deduplicate`);
-            } else {
-                console.log(`⏭️ Skipping chat history (client already loaded)`);
-            }
+            const messages = await getChatHistory(conversationId, 50);
+            socket.emit('chat_history', {
+                conversationId,
+                messages,
+                hasMore: messages.length === 50,
+                timestamp: new Date().toISOString()
+            });
             
             await markMessagesAsRead(conversationId, userId);
             
@@ -431,7 +423,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    // ✅ SEND OFFER
+    // ✅ SEND OFFER - MODIFIED: Don't create another message, just broadcast existing one
     socket.on('send_offer', async (data) => {
         try {
             const { conversationId, offerData } = data;
@@ -445,25 +437,67 @@ io.on('connection', (socket) => {
             
             console.log(`📝 Offer from ${senderId} in chat ${conversationId}:`, offerData);
             
-            // ✅ Save message with offer data as JSON string
-            const message = await saveMessage({
-                conversationId,
-                senderId: senderId,
-                content: JSON.stringify(offerData),
-                messageType: 'offer',
-            });
-            
+            // ✅ Get the sender info
             const senderInfo = await getUserInfo(senderId);
+            
+            // ✅ Check if this offer already exists in the database
+            const offerId = offerData.offer_id;
+            
+            let message = null;
+            
+            if (offerId) {
+                // ✅ Try to find the existing message
+                const [rows] = await pool.query(
+                    `SELECT 
+                        id,
+                        conversation_id as conversationId,
+                        sender_id as senderId,
+                        content,
+                        message_type as messageType,
+                        is_read as isRead,
+                        created_at as createdAt
+                    FROM messages 
+                    WHERE conversation_id = ? 
+                    AND message_type = 'offer'
+                    AND content LIKE ?`,
+                    [conversationId, `%"offer_id":${offerId}%`]
+                );
+                
+                if (rows.length > 0) {
+                    message = {
+                        id: rows[0].id,
+                        conversationId: rows[0].conversationId,
+                        senderId: rows[0].senderId,
+                        content: rows[0].content,
+                        messageType: 'offer',
+                        isRead: rows[0].isRead,
+                        createdAt: rows[0].createdAt ? rows[0].createdAt.toISOString() : new Date().toISOString()
+                    };
+                    console.log(`✅ Found existing offer message: ${message.id}`);
+                }
+            }
+            
+            // ✅ If no existing message found, create one (fallback)
+            if (!message) {
+                console.log(`⚠️ No existing message found, creating new one (fallback)`);
+                message = await saveMessage({
+                    conversationId,
+                    senderId: senderId,
+                    content: JSON.stringify(offerData),
+                    messageType: 'offer',
+                });
+                console.log(`💾 New offer message saved: ${message.id}`);
+            }
             
             const messageData = {
                 id: message.id,
-                conversationId,
-                senderId: senderId,
+                conversationId: conversationId,
+                senderId: message.senderId || senderId,
                 senderName: senderInfo?.name || `User ${senderId}`,
                 senderImage: senderInfo?.profile_image || null,
-                content: JSON.stringify(offerData),
+                content: message.content || JSON.stringify(offerData),
                 messageType: 'offer',
-                createdAt: message.createdAt,
+                createdAt: message.createdAt || new Date().toISOString(),
                 is_read: 0,
                 attachments: [],
             };
@@ -483,7 +517,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    // ✅ Handle offer updated (accepted/declined) - With graceful error handling
+    // ✅ Handle offer updated (accepted/declined)
     socket.on('offer_updated', async (data) => {
         try {
             const { conversationId, offerId, status, orderId } = data;
