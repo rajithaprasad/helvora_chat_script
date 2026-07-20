@@ -107,8 +107,8 @@ io.on('connection', (socket) => {
     console.log(`🔵 User connected: ${userId} (${userName})`);
     console.log(`📊 Active connections: ${io.engine.clientsCount}`);
     
-    // JOIN CHAT ROOM
-    socket.on('join_chat', async ({ conversationId }) => {
+    // ✅ JOIN CHAT ROOM - MODIFIED: Don't send chat_history
+    socket.on('join_chat', async ({ conversationId, skipHistory = false }) => {
         const roomName = `chat_${conversationId}`;
         
         const rooms = Array.from(socket.rooms);
@@ -130,13 +130,21 @@ io.on('connection', (socket) => {
         roomMembers.get(roomName).add(userId);
         
         try {
-            const messages = await getChatHistory(conversationId, 50);
-            socket.emit('chat_history', {
-                conversationId,
-                messages,
-                hasMore: messages.length === 50,
-                timestamp: new Date().toISOString()
-            });
+            // ✅ ONLY send chat_history if skipHistory is false AND we're not already loaded
+            // We'll let the client load via REST API instead
+            if (!skipHistory) {
+                // ✅ Still send chat_history for backward compatibility, but client should use REST
+                const messages = await getChatHistory(conversationId, 50);
+                socket.emit('chat_history', {
+                    conversationId,
+                    messages,
+                    hasMore: messages.length === 50,
+                    timestamp: new Date().toISOString()
+                });
+                console.log(`📤 Sent chat history (${messages.length} messages) - client will deduplicate`);
+            } else {
+                console.log(`⏭️ Skipping chat history (client already loaded)`);
+            }
             
             await markMessagesAsRead(conversationId, userId);
             
@@ -490,16 +498,14 @@ io.on('connection', (socket) => {
             
             if (offerRows.length === 0) {
                 console.log(`⚠️ Offer ${offerId} not found`);
-                // ✅ Don't send error, just log it
                 return;
             }
             
             const offer = offerRows[0];
             
-            // ✅ Find the message that contains this offer - BETTER QUERY
+            // ✅ Find the message that contains this offer
             let message = null;
             
-            // First try: Find by offer_id in content using LIKE
             const [messageRows] = await pool.query(
                 `SELECT * FROM messages 
                  WHERE conversation_id = ? 
@@ -512,7 +518,6 @@ io.on('connection', (socket) => {
                 message = messageRows[0];
                 console.log(`✅ Found message via LIKE query: ${message.id}`);
             } else {
-                // ✅ Second try: Get all offer messages and parse JSON
                 console.log(`⚠️ No message found with LIKE query, trying JSON parsing...`);
                 const [allOfferMessages] = await pool.query(
                     `SELECT * FROM messages 
@@ -524,14 +529,12 @@ io.on('connection', (socket) => {
                 for (const msg of allOfferMessages) {
                     try {
                         const parsed = JSON.parse(msg.content);
-                        // Check if this message contains the offer_id
                         if (parsed.offer_id === offerId || parsed.id === offerId) {
                             message = msg;
                             console.log(`✅ Found message via JSON parsing: ${message.id}`);
                             break;
                         }
                     } catch (e) {
-                        // Skip invalid JSON
                         continue;
                     }
                 }
@@ -539,7 +542,6 @@ io.on('connection', (socket) => {
             
             if (!message) {
                 console.log(`⚠️ No message found for offer ${offerId}, but offer was updated in DB`);
-                // ✅ Don't send error, just log it and return
                 return;
             }
             
@@ -550,16 +552,13 @@ io.on('connection', (socket) => {
                 offerData.order_id = orderId;
             }
             
-            // ✅ Update the message content
             await pool.query(
                 'UPDATE messages SET content = ? WHERE id = ?',
                 [JSON.stringify(offerData), message.id]
             );
             
-            // ✅ Get sender info
             const senderInfo = await getUserInfo(message.sender_id);
             
-            // ✅ Broadcast updated message to room
             const roomName = `chat_${conversationId}`;
             const messageData = {
                 id: message.id,
@@ -577,7 +576,6 @@ io.on('connection', (socket) => {
             io.to(roomName).emit('offer_updated', messageData);
             console.log(`📤 Broadcasted offer update to room: ${roomName}`);
             
-            // ✅ Also send a system message about the offer status change
             let statusMessage = '';
             if (status === 'accepted') {
                 statusMessage = `✅ Offer accepted! Work order #${orderId || 'created'} has been created.`;
@@ -612,8 +610,6 @@ io.on('connection', (socket) => {
             
         } catch (error) {
             console.error('❌ Error handling offer update:', error);
-            // ✅ Don't emit error to client, just log it
-            // The offer was already updated in the database
         }
     });
     
@@ -682,7 +678,6 @@ async function getChatHistory(conversationId, limit = 50, offset = 0) {
     
     const messages = [];
     for (const row of rows.reverse()) {
-        // ✅ Always fetch attachments for every message
         const [attachments] = await pool.query(
             `SELECT 
                 id,
@@ -701,13 +696,11 @@ async function getChatHistory(conversationId, limit = 50, offset = 0) {
             [row.id]
         );
         
-        // ✅ If there are attachments, force messageType to 'file'
         let messageType = row.messageType;
         if (attachments.length > 0 && messageType !== 'offer') {
             messageType = 'file';
         }
         
-        // ✅ If content is JSON and looks like an offer, set to 'offer'
         if (typeof row.content === 'string' && row.content.startsWith('{')) {
             try {
                 const parsed = JSON.parse(row.content);
