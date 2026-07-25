@@ -107,29 +107,67 @@ io.on('connection', (socket) => {
     console.log(`🔵 User connected: ${userId} (${userName})`);
     console.log(`📊 Active connections: ${io.engine.clientsCount}`);
     
-    // JOIN CHAT ROOM
+    // JOIN CHAT ROOM - FIXED with verification
     socket.on('join_chat', async ({ conversationId }) => {
         const roomName = `chat_${conversationId}`;
         
-        const rooms = Array.from(socket.rooms);
-        rooms.forEach(room => {
-            if (room.startsWith('chat_')) {
-                socket.leave(room);
-                console.log(`📤 Left room: ${room}`);
-            }
-        });
-        
-        socket.join(roomName);
-        socket.data.currentRoom = roomName;
-        
-        console.log(`📩 User ${userId} joined chat room: ${roomName}`);
-        
-        if (!roomMembers.has(roomName)) {
-            roomMembers.set(roomName, new Set());
-        }
-        roomMembers.get(roomName).add(userId);
-        
+        // ✅ Verify conversation exists in database
         try {
+            const [convRows] = await pool.query(
+                'SELECT id, status, customer_id, seller_id FROM conversations WHERE id = ?',
+                [conversationId]
+            );
+            
+            if (convRows.length === 0) {
+                console.log(`⚠️ Conversation ${conversationId} does not exist in database`);
+                socket.emit('error', { 
+                    message: 'Conversation not found',
+                    details: 'The conversation does not exist in the database'
+                });
+                return;
+            }
+            
+            const conv = convRows[0];
+            
+            // ✅ Check if user is part of this conversation
+            if (userId != conv.customer_id && userId != conv.seller_id) {
+                console.log(`⚠️ User ${userId} is not part of conversation ${conversationId}`);
+                socket.emit('error', { 
+                    message: 'Unauthorized',
+                    details: 'You are not a participant in this conversation'
+                });
+                return;
+            }
+            
+            // ✅ If conversation is not active, reactivate it
+            if (conv.status !== 'active') {
+                await pool.query(
+                    'UPDATE conversations SET status = "active", updated_at = NOW() WHERE id = ?',
+                    [conversationId]
+                );
+                console.log(`✅ Reactivated conversation ${conversationId}`);
+            }
+            
+            // Leave any existing chat rooms
+            const rooms = Array.from(socket.rooms);
+            rooms.forEach(room => {
+                if (room.startsWith('chat_')) {
+                    socket.leave(room);
+                    console.log(`📤 Left room: ${room}`);
+                }
+            });
+            
+            socket.join(roomName);
+            socket.data.currentRoom = roomName;
+            
+            console.log(`📩 User ${userId} joined chat room: ${roomName}`);
+            
+            if (!roomMembers.has(roomName)) {
+                roomMembers.set(roomName, new Set());
+            }
+            roomMembers.get(roomName).add(userId);
+            
+            // ✅ Get chat history
             const messages = await getChatHistory(conversationId, 50);
             socket.emit('chat_history', {
                 conversationId,
@@ -138,8 +176,10 @@ io.on('connection', (socket) => {
                 timestamp: new Date().toISOString()
             });
             
+            // ✅ Mark messages as read
             await markMessagesAsRead(conversationId, userId);
             
+            // ✅ Notify others
             socket.to(roomName).emit('user_joined', {
                 userId,
                 userName,
@@ -147,15 +187,15 @@ io.on('connection', (socket) => {
             });
             
         } catch (error) {
-            console.error('Error loading chat history:', error);
+            console.error('Error joining chat:', error);
             socket.emit('error', { 
-                message: 'Failed to load chat history',
+                message: 'Failed to join chat',
                 details: error.message 
             });
         }
     });
     
-    // ✅ SEND MESSAGE - With attachment support (for text and file messages)
+    // SEND MESSAGE - FIXED with verification
     socket.on('send_message', async (data) => {
         console.log('📨 send_message received:', JSON.stringify(data));
         
@@ -171,6 +211,42 @@ io.on('connection', (socket) => {
             const senderId = socket.data.userId;
             console.log(`📝 Sender: ${senderId}, Conversation: ${conversationId}`);
 
+            // ✅ VERIFY conversation exists
+            const [convRows] = await pool.query(
+                'SELECT id, status, customer_id, seller_id FROM conversations WHERE id = ?',
+                [conversationId]
+            );
+            
+            if (convRows.length === 0) {
+                console.error(`❌ Conversation ${conversationId} does not exist`);
+                socket.emit('error', { 
+                    message: 'Conversation not found',
+                    details: 'The conversation does not exist in the database'
+                });
+                return;
+            }
+            
+            const conv = convRows[0];
+            
+            // ✅ If conversation is not active, reactivate it
+            if (conv.status !== 'active') {
+                await pool.query(
+                    'UPDATE conversations SET status = "active", updated_at = NOW() WHERE id = ?',
+                    [conversationId]
+                );
+                console.log(`✅ Reactivated conversation ${conversationId}`);
+            }
+
+            // ✅ Check if sender is part of this conversation
+            if (senderId != conv.customer_id && senderId != conv.seller_id) {
+                console.error(`❌ Sender ${senderId} not part of conversation ${conversationId}`);
+                socket.emit('error', { 
+                    message: 'Unauthorized',
+                    details: 'You are not a participant in this conversation'
+                });
+                return;
+            }
+
             // ✅ If attachment_id is provided, fetch attachment details
             let attachment = null;
             let existingMessageId = null;
@@ -183,7 +259,6 @@ io.on('connection', (socket) => {
                 );
                 if (rows.length > 0) {
                     attachment = rows[0];
-                    // ✅ Check if attachment already has a message_id
                     if (attachment.message_id) {
                         existingMessageId = attachment.message_id;
                         console.log(`✅ Attachment already linked to message: ${existingMessageId}`);
@@ -201,12 +276,10 @@ io.on('connection', (socket) => {
             if (attachment) {
                 finalMessageType = 'file';
                 
-                // ✅ For images: NO text at all
                 if (attachment.is_image) {
-                    finalContent = ''; // ✅ Completely empty for images
+                    finalContent = '';
                     console.log('📸 Image message - no text');
                 } else {
-                    // ✅ For files: show file name
                     finalContent = `📎 ${attachment.file_name}`;
                     console.log(`📎 File message: ${finalContent}`);
                 }
@@ -238,7 +311,7 @@ io.on('connection', (socket) => {
                         conversationId: rows[0].conversationId,
                         senderId: rows[0].senderId,
                         content: rows[0].content,
-                        messageType: 'file', // ✅ Force to 'file' since it has attachment
+                        messageType: 'file',
                         isRead: rows[0].isRead,
                         createdAt: rows[0].createdAt ? rows[0].createdAt.toISOString() : new Date().toISOString()
                     };
@@ -256,7 +329,7 @@ io.on('connection', (socket) => {
                 });
                 console.log(`💾 New message saved: ${message.id}`);
 
-                // ✅ Link attachment to message (only if not already linked)
+                // ✅ Link attachment to message
                 if (attachment && attachment_id) {
                     await pool.query(
                         'UPDATE message_attachments SET message_id = ? WHERE id = ? AND message_id IS NULL',
@@ -304,12 +377,12 @@ io.on('connection', (socket) => {
 
             const messageData = {
                 id: message.id,
-                conversationId,
+                conversationId: conversationId,
                 senderId: senderId,
                 senderName: senderInfo?.name || `User ${senderId}`,
                 senderImage: senderInfo?.profile_image || null,
                 content: message.content || finalContent,
-                messageType: 'file', // ✅ Force to 'file' if has attachments
+                messageType: attachments.length > 0 ? 'file' : finalMessageType,
                 createdAt: message.createdAt,
                 is_read: 0,
                 attachments: attachments,
@@ -336,12 +409,24 @@ io.on('connection', (socket) => {
         }
     });
     
-    // ✅ NEW: Handle new file uploaded (from mobile app after PHP upload)
+    // NEW: Handle new file uploaded (from mobile app after PHP upload)
     socket.on('new_file_uploaded', async (data) => {
         try {
             const { conversationId, messageId, attachmentId } = data;
             
             console.log(`📎 New file uploaded - conversation: ${conversationId}, message: ${messageId}, attachment: ${attachmentId}`);
+            
+            // ✅ Verify conversation exists
+            const [convRows] = await pool.query(
+                'SELECT id FROM conversations WHERE id = ?',
+                [conversationId]
+            );
+            
+            if (convRows.length === 0) {
+                console.log(`⚠️ Conversation ${conversationId} not found`);
+                socket.emit('error', { message: 'Conversation not found' });
+                return;
+            }
             
             // ✅ Get the message with attachment
             const [messageRows] = await pool.query(
@@ -396,7 +481,7 @@ io.on('connection', (socket) => {
                 senderName: message.senderName || 'User',
                 senderImage: message.senderImage || null,
                 content: message.content || '',
-                messageType: 'file', // ✅ Force to 'file' since it has attachment
+                messageType: 'file',
                 isRead: message.isRead || 0,
                 createdAt: message.createdAt ? message.createdAt.toISOString() : new Date().toISOString(),
                 attachments: attachments.map(a => ({
@@ -423,8 +508,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    // ✅ SEND OFFER - FIXED: Server doesn't create anything, just broadcasts
-    // The client will send the full message data directly
+    // SEND OFFER
     socket.on('send_offer', async (data) => {
         try {
             const { conversationId, offerData, messageId } = data;
@@ -437,6 +521,18 @@ io.on('connection', (socket) => {
             const senderId = socket.data.userId;
             
             console.log(`📝 Offer broadcast from ${senderId} in chat ${conversationId}:`, offerData);
+            
+            // ✅ Verify conversation exists
+            const [convRows] = await pool.query(
+                'SELECT id FROM conversations WHERE id = ?',
+                [conversationId]
+            );
+            
+            if (convRows.length === 0) {
+                console.log(`⚠️ Conversation ${conversationId} not found`);
+                socket.emit('error', { message: 'Conversation not found' });
+                return;
+            }
             
             // ✅ Get sender info
             const senderInfo = await getUserInfo(senderId);
@@ -470,7 +566,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    // ✅ Handle offer updated (accepted/declined)
+    // Handle offer updated (accepted/declined)
     socket.on('offer_updated', async (data) => {
         try {
             const { conversationId, offerId, status, orderId } = data;
