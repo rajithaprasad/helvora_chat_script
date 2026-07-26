@@ -773,7 +773,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    // ✅ PRICE CHANGE - Accept
+    // ✅ PRICE CHANGE - Accept - FIXED (removed total_amount update)
     socket.on('accept_price_change', async (data) => {
         try {
             const { orderId } = data;
@@ -797,14 +797,15 @@ io.on('connection', (socket) => {
                 return;
             }
             
+            // ✅ FIX: ONLY update status, NOT total_amount
+            // The total_amount is already updated by update-order-price.php
             await pool.query(
                 `UPDATE work_orders 
-                SET total_amount = ?, 
-                    pending_price = NULL, 
+                SET pending_price = NULL, 
                     price_change_status = 'accepted',
                     updated_at = NOW() 
                 WHERE id = ?`,
-                [order.pending_price, orderId]
+                [orderId]
             );
             
             const roomName = `chat_${orderId}`;
