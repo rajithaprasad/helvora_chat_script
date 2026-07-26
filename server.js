@@ -16,6 +16,7 @@ try {
     console.log('✅ Database module loaded successfully');
 } catch (error) {
     console.error('❌ Failed to load database module:', error.message);
+    // Create a dummy pool for fallback
     pool = {
         query: async () => { throw new Error('Database not configured'); }
     };
@@ -107,7 +108,7 @@ app.get('/test-db', async (req, res) => {
     }
 });
 
-// ✅ DEBUG endpoints
+// ✅ DEBUG: Get all conversations
 app.get('/debug/conversations', async (req, res) => {
     try {
         if (!pool) {
@@ -127,6 +128,7 @@ app.get('/debug/conversations', async (req, res) => {
     }
 });
 
+// ✅ DEBUG: Get specific conversation
 app.get('/debug/conversation/:id', async (req, res) => {
     try {
         if (!pool) {
@@ -153,6 +155,7 @@ app.get('/debug/conversation/:id', async (req, res) => {
     }
 });
 
+// ✅ DEBUG: Get messages for a conversation
 app.get('/debug/messages/:conversationId', async (req, res) => {
     try {
         if (!pool) {
@@ -176,127 +179,7 @@ app.get('/debug/messages/:conversationId', async (req, res) => {
     }
 });
 
-// ============================================
-// ✅ PUSH NOTIFICATION FUNCTIONS
-// ============================================
-
-async function getPushTokens(userId) {
-    if (!pool) return [];
-    try {
-        const [rows] = await pool.query(
-            'SELECT token FROM push_tokens WHERE user_id = ?',
-            [userId]
-        );
-        return rows.map(row => row.token);
-    } catch (error) {
-        console.error('Error getting push tokens:', error);
-        return [];
-    }
-}
-
-async function sendPushNotification(deviceTokens, title, body, data = {}) {
-    if (!deviceTokens || deviceTokens.length === 0) {
-        return { success: false, error: 'No device tokens', sent: 0 };
-    }
-
-    const url = 'https://exp.host/--/api/v2/push/send';
-    
-    const messages = deviceTokens.map(token => ({
-        to: token,
-        sound: 'notification.wav',
-        title: title,
-        body: body,
-        priority: 'high',
-        data: data,
-        channelId: 'order_requests',
-        _displayInForeground: true,
-    }));
-
-    try {
-        const response = await fetch(url, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json',
-            },
-            body: JSON.stringify(messages),
-        });
-
-        const result = await response.json();
-        
-        let successCount = 0;
-        if (result.data) {
-            result.data.forEach((item, index) => {
-                if (item.status === 'ok') {
-                    successCount++;
-                } else if (item.details && 
-                    (item.details.error === 'DeviceNotRegistered' || 
-                     item.details.error === 'InvalidCredentials')) {
-                    // Remove invalid token
-                    removeInvalidToken(deviceTokens[index]);
-                }
-            });
-        }
-
-        return { success: true, sent: successCount, total: deviceTokens.length };
-    } catch (error) {
-        console.error('Error sending push notification:', error);
-        return { success: false, error: error.message, sent: 0 };
-    }
-}
-
-async function removeInvalidToken(token) {
-    if (!pool) return;
-    try {
-        await pool.query('DELETE FROM push_tokens WHERE token = ?', [token]);
-    } catch (error) {
-        console.error('Error removing invalid token:', error);
-    }
-}
-
-async function sendOrderNotification(notificationData) {
-    const { 
-        userId, 
-        title, 
-        body, 
-        type, 
-        orderId, 
-        conversationId,
-        actorName,
-        actorId,
-        extraData = {} 
-    } = notificationData;
-
-    // Get user's push tokens
-    const tokens = await getPushTokens(userId);
-    
-    if (tokens.length === 0) {
-        console.log(`📱 No push tokens found for user ${userId}`);
-        return { success: false, sent: 0, message: 'No tokens found' };
-    }
-
-    const data = {
-        type: type,
-        order_id: String(orderId),
-        conversation_id: String(conversationId || ''),
-        user_id: String(userId),
-        actor_id: String(actorId || ''),
-        actor_name: actorName || '',
-        ...extraData,
-        critical: 'true',
-    };
-
-    console.log(`📱 Sending push notification to ${tokens.length} devices for user ${userId}`);
-    console.log(`📱 Title: ${title}, Body: ${body}`);
-
-    const result = await sendPushNotification(tokens, title, body, data);
-    return result;
-}
-
-// ============================================
-// ✅ SOCKET.IO AUTHENTICATION
-// ============================================
-
+// Socket.io authentication
 io.use((socket, next) => {
     const auth = socket.handshake.auth;
     
@@ -324,7 +207,7 @@ io.on('connection', (socket) => {
     console.log(`🔵 User connected: ${userId} (${userName})`);
     console.log(`📊 Active connections: ${io.engine.clientsCount}`);
     
-    // JOIN CHAT ROOM
+    // JOIN CHAT ROOM - FIXED with verification
     socket.on('join_chat', async ({ conversationId }) => {
         const roomName = `chat_${conversationId}`;
         
@@ -340,6 +223,7 @@ io.on('connection', (socket) => {
                 return;
             }
             
+            // ✅ Check if conversation exists
             const [convRows] = await pool.query(
                 'SELECT id, status, customer_id, seller_id FROM conversations WHERE id = ?',
                 [conversationId]
@@ -369,6 +253,7 @@ io.on('connection', (socket) => {
             const conv = convRows[0];
             console.log(`✅ Found conversation:`, conv);
             
+            // ✅ Check if user is part of this conversation
             if (userId != conv.customer_id && userId != conv.seller_id) {
                 console.log(`⚠️ User ${userId} is not part of conversation ${conversationId}`);
                 socket.emit('error', { 
@@ -378,6 +263,7 @@ io.on('connection', (socket) => {
                 return;
             }
             
+            // ✅ If conversation is not active, reactivate it
             if (conv.status !== 'active') {
                 await pool.query(
                     'UPDATE conversations SET status = "active", updated_at = NOW() WHERE id = ?',
@@ -386,6 +272,7 @@ io.on('connection', (socket) => {
                 console.log(`✅ Reactivated conversation ${conversationId}`);
             }
             
+            // Leave any existing chat rooms
             const rooms = Array.from(socket.rooms);
             rooms.forEach(room => {
                 if (room.startsWith('chat_')) {
@@ -404,6 +291,7 @@ io.on('connection', (socket) => {
             }
             roomMembers.get(roomName).add(userId);
             
+            // ✅ Get chat history
             const messages = await getChatHistory(conversationId, 50);
             socket.emit('chat_history', {
                 conversationId,
@@ -412,8 +300,10 @@ io.on('connection', (socket) => {
                 timestamp: new Date().toISOString()
             });
             
+            // ✅ Mark messages as read
             await markMessagesAsRead(conversationId, userId);
             
+            // ✅ Notify others
             socket.to(roomName).emit('user_joined', {
                 userId,
                 userName,
@@ -429,7 +319,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    // SEND MESSAGE
+    // SEND MESSAGE - Simplified for now
     socket.on('send_message', async (data) => {
         console.log('📨 send_message received:', JSON.stringify(data));
         
@@ -451,6 +341,7 @@ io.on('connection', (socket) => {
             const senderId = socket.data.userId;
             console.log(`📝 Sender: ${senderId}, Conversation: ${conversationId}`);
 
+            // ✅ VERIFY conversation exists
             const [convRows] = await pool.query(
                 'SELECT id, status, customer_id, seller_id FROM conversations WHERE id = ?',
                 [conversationId]
@@ -467,6 +358,7 @@ io.on('connection', (socket) => {
             
             const conv = convRows[0];
             
+            // ✅ If conversation is not active, reactivate it
             if (conv.status !== 'active') {
                 await pool.query(
                     'UPDATE conversations SET status = "active", updated_at = NOW() WHERE id = ?',
@@ -475,6 +367,7 @@ io.on('connection', (socket) => {
                 console.log(`✅ Reactivated conversation ${conversationId}`);
             }
 
+            // ✅ Check if sender is part of this conversation
             if (senderId != conv.customer_id && senderId != conv.seller_id) {
                 console.error(`❌ Sender ${senderId} not part of conversation ${conversationId}`);
                 socket.emit('error', { 
@@ -484,6 +377,7 @@ io.on('connection', (socket) => {
                 return;
             }
 
+            // ✅ Save message
             const message = await saveMessage({
                 conversationId,
                 senderId: senderId,
@@ -513,27 +407,6 @@ io.on('connection', (socket) => {
 
             await updateConversationTimestamp(conversationId);
 
-            // ✅ Send push notification for new message
-            const otherUserId = senderId === conv.customer_id ? conv.seller_id : conv.customer_id;
-            const otherUserInfo = await getUserInfo(otherUserId);
-            
-            if (otherUserInfo) {
-                await sendOrderNotification({
-                    userId: otherUserId,
-                    title: `New message from ${senderInfo?.name || 'User'}`,
-                    body: content || 'New message',
-                    type: 'new_message',
-                    orderId: conversationId,
-                    conversationId: conversationId,
-                    actorName: senderInfo?.name || 'User',
-                    actorId: senderId,
-                    extraData: {
-                        message_id: String(message.id),
-                        message_type: messageType,
-                    }
-                });
-            }
-
         } catch (error) {
             console.error('❌ Error sending message:', error);
             socket.emit('error', { 
@@ -543,7 +416,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    // FILE UPLOAD
+    // ✅ NEW: Handle file uploaded
     socket.on('new_file_uploaded', async (data) => {
         try {
             const { conversationId, messageId, attachmentId } = data;
@@ -636,7 +509,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    // SEND OFFER
+    // ✅ SEND OFFER
     socket.on('send_offer', async (data) => {
         try {
             const { conversationId, offerData, messageId } = data;
@@ -651,7 +524,7 @@ io.on('connection', (socket) => {
             console.log(`📝 Offer broadcast from ${senderId} in chat ${conversationId}:`, offerData);
             
             const [convRows] = await pool.query(
-                'SELECT id, customer_id, seller_id FROM conversations WHERE id = ?',
+                'SELECT id FROM conversations WHERE id = ?',
                 [conversationId]
             );
             
@@ -661,7 +534,6 @@ io.on('connection', (socket) => {
                 return;
             }
             
-            const conv = convRows[0];
             const senderInfo = await getUserInfo(senderId);
             
             const messageData = {
@@ -682,32 +554,7 @@ io.on('connection', (socket) => {
             console.log(`📤 Broadcasted offer ${offerData.offer_id} from ${senderId} to room: ${roomName}`);
             
             await updateConversationTimestamp(conversationId);
-
-            // ✅ Send push notification for new offer
-            const otherUserId = senderId === conv.customer_id ? conv.seller_id : conv.customer_id;
-            const otherUserInfo = await getUserInfo(otherUserId);
             
-            if (otherUserInfo) {
-                const serviceName = offerData.service_name || 'Service';
-                const price = offerData.price || offerData.total_price || 0;
-                
-                await sendOrderNotification({
-                    userId: otherUserId,
-                    title: `📋 Custom Offer Received`,
-                    body: `${senderInfo?.name || 'User'} sent you an offer: ${serviceName} - LKR ${Number(price).toLocaleString()}`,
-                    type: 'new_offer',
-                    orderId: conversationId,
-                    conversationId: conversationId,
-                    actorName: senderInfo?.name || 'User',
-                    actorId: senderId,
-                    extraData: {
-                        offer_id: String(offerData.offer_id || ''),
-                        service_name: serviceName,
-                        price: String(price),
-                    }
-                });
-            }
-
         } catch (error) {
             console.error('❌ Error sending offer:', error);
             socket.emit('error', { 
@@ -717,7 +564,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    // OFFER UPDATED (accepted/declined)
+    // ✅ Handle offer updated (accepted/declined)
     socket.on('offer_updated', async (data) => {
         try {
             const { conversationId, offerId, status, orderId } = data;
@@ -736,13 +583,6 @@ io.on('connection', (socket) => {
             
             const offer = offerRows[0];
             
-            const [convRows] = await pool.query(
-                'SELECT customer_id, seller_id FROM conversations WHERE id = ?',
-                [conversationId]
-            );
-            
-            const conv = convRows[0];
-            
             let message = null;
             
             const [messageRows] = await pool.query(
@@ -755,7 +595,9 @@ io.on('connection', (socket) => {
             
             if (messageRows.length > 0) {
                 message = messageRows[0];
+                console.log(`✅ Found message via LIKE query: ${message.id}`);
             } else {
+                console.log(`⚠️ No message found with LIKE query, trying JSON parsing...`);
                 const [allOfferMessages] = await pool.query(
                     `SELECT * FROM messages 
                      WHERE conversation_id = ? 
@@ -768,6 +610,7 @@ io.on('connection', (socket) => {
                         const parsed = JSON.parse(msg.content);
                         if (parsed.offer_id === offerId || parsed.id === offerId) {
                             message = msg;
+                            console.log(`✅ Found message via JSON parsing: ${message.id}`);
                             break;
                         }
                     } catch (e) {
@@ -777,7 +620,7 @@ io.on('connection', (socket) => {
             }
             
             if (!message) {
-                console.log(`⚠️ No message found for offer ${offerId}`);
+                console.log(`⚠️ No message found for offer ${offerId}, but offer was updated in DB`);
                 return;
             }
             
@@ -812,17 +655,10 @@ io.on('connection', (socket) => {
             console.log(`📤 Broadcasted offer update to room: ${roomName}`);
             
             let statusMessage = '';
-            let notificationTitle = '';
-            let notificationBody = '';
-            
             if (status === 'accepted') {
                 statusMessage = `✅ Offer accepted! Work order #${orderId || 'created'} has been created.`;
-                notificationTitle = `✅ Offer Accepted!`;
-                notificationBody = `${senderInfo?.name || 'User'} accepted your offer. Work order #${orderId || 'created'} has been created.`;
             } else if (status === 'declined') {
                 statusMessage = `❌ Offer declined.`;
-                notificationTitle = `❌ Offer Declined`;
-                notificationBody = `${senderInfo?.name || 'User'} declined your offer.`;
             }
             
             if (statusMessage) {
@@ -849,28 +685,7 @@ io.on('connection', (socket) => {
                 io.to(roomName).emit('new_message', systemMessageData);
                 console.log(`📤 Broadcasted system message to room: ${roomName}`);
             }
-
-            // ✅ Send push notification for offer status update
-            const actorId = socket.data.userId;
-            const actorName = socket.data.userName;
-            const otherUserId = actorId === conv.customer_id ? conv.seller_id : conv.customer_id;
             
-            await sendOrderNotification({
-                userId: otherUserId,
-                title: notificationTitle || `Offer ${status}`,
-                body: notificationBody || `${actorName} updated the offer to ${status}`,
-                type: `offer_${status}`,
-                orderId: conversationId,
-                conversationId: conversationId,
-                actorName: actorName,
-                actorId: actorId,
-                extraData: {
-                    offer_id: String(offerId),
-                    status: status,
-                    order_id: String(orderId || ''),
-                }
-            });
-
         } catch (error) {
             console.error('❌ Error handling offer update:', error);
         }
@@ -903,16 +718,15 @@ io.on('connection', (socket) => {
         }
     });
     
-    // ============================================
-    // ✅ ORDER MANAGEMENT FEATURES WITH PUSH NOTIFICATIONS
-    // ============================================
+    // ✅ ============================================
+    // ✅ ORDER MANAGEMENT FEATURES
+    // ✅ ============================================
     
-    // PRICE CHANGE - Request
+    // ✅ PRICE CHANGE - Request
     socket.on('request_price_change', async (data) => {
         try {
             const { orderId, newPrice, reason } = data;
             const sellerId = socket.data.userId;
-            const sellerName = socket.data.userName;
             
             console.log(`💰 Price change requested for order ${orderId}: ${newPrice}`);
             
@@ -952,25 +766,6 @@ io.on('connection', (socket) => {
             });
             
             console.log(`📤 Price change request broadcasted to room: ${roomName}`);
-
-            // ✅ Send push notification to customer
-            const customerInfo = await getUserInfo(order.customer_id);
-            if (customerInfo) {
-                await sendOrderNotification({
-                    userId: order.customer_id,
-                    title: `💰 Price Change Request`,
-                    body: `${sellerName} requested a price change to LKR ${Number(newPrice).toLocaleString()}`,
-                    type: 'price_change_request',
-                    orderId: orderId,
-                    conversationId: orderId,
-                    actorName: sellerName,
-                    actorId: sellerId,
-                    extraData: {
-                        new_price: String(newPrice),
-                        reason: reason || '',
-                    }
-                });
-            }
             
         } catch (error) {
             console.error('❌ Error requesting price change:', error);
@@ -978,12 +773,11 @@ io.on('connection', (socket) => {
         }
     });
     
-    // PRICE CHANGE - Accept
+    // ✅ PRICE CHANGE - Accept
     socket.on('accept_price_change', async (data) => {
         try {
             const { orderId } = data;
             const customerId = socket.data.userId;
-            const customerName = socket.data.userName;
             
             console.log(`✅ Price change accepted for order ${orderId}`);
             
@@ -1021,24 +815,6 @@ io.on('connection', (socket) => {
             });
             
             console.log(`📤 Price change acceptance broadcasted to room: ${roomName}`);
-
-            // ✅ Send push notification to seller
-            const sellerInfo = await getUserInfo(order.seller_id);
-            if (sellerInfo) {
-                await sendOrderNotification({
-                    userId: order.seller_id,
-                    title: `✅ Price Change Accepted`,
-                    body: `${customerName} accepted the price change to LKR ${Number(order.pending_price).toLocaleString()}`,
-                    type: 'price_change_accepted',
-                    orderId: orderId,
-                    conversationId: orderId,
-                    actorName: customerName,
-                    actorId: customerId,
-                    extraData: {
-                        new_price: String(order.pending_price),
-                    }
-                });
-            }
             
         } catch (error) {
             console.error('❌ Error accepting price change:', error);
@@ -1046,17 +822,16 @@ io.on('connection', (socket) => {
         }
     });
     
-    // PRICE CHANGE - Reject
+    // ✅ PRICE CHANGE - Reject
     socket.on('reject_price_change', async (data) => {
         try {
             const { orderId } = data;
             const customerId = socket.data.userId;
-            const customerName = socket.data.userName;
             
             console.log(`❌ Price change rejected for order ${orderId}`);
             
             const [orderRows] = await pool.query(
-                'SELECT customer_id, seller_id FROM work_orders WHERE id = ?',
+                'SELECT customer_id FROM work_orders WHERE id = ?',
                 [orderId]
             );
             
@@ -1087,21 +862,6 @@ io.on('connection', (socket) => {
             });
             
             console.log(`📤 Price change rejection broadcasted to room: ${roomName}`);
-
-            // ✅ Send push notification to seller
-            const sellerInfo = await getUserInfo(order.seller_id);
-            if (sellerInfo) {
-                await sendOrderNotification({
-                    userId: order.seller_id,
-                    title: `❌ Price Change Rejected`,
-                    body: `${customerName} rejected the price change request`,
-                    type: 'price_change_rejected',
-                    orderId: orderId,
-                    conversationId: orderId,
-                    actorName: customerName,
-                    actorId: customerId,
-                });
-            }
             
         } catch (error) {
             console.error('❌ Error rejecting price change:', error);
@@ -1109,12 +869,11 @@ io.on('connection', (socket) => {
         }
     });
     
-    // DEADLINE EXTENSION - Request
+    // ✅ DEADLINE EXTENSION - Request
     socket.on('request_deadline_extension', async (data) => {
         try {
             const { orderId, newDeadline, reason } = data;
             const sellerId = socket.data.userId;
-            const sellerName = socket.data.userName;
             
             console.log(`📅 Deadline extension requested for order ${orderId}: ${newDeadline}`);
             
@@ -1154,30 +913,6 @@ io.on('connection', (socket) => {
             });
             
             console.log(`📤 Deadline extension request broadcasted to room: ${roomName}`);
-
-            // ✅ Send push notification to customer
-            const customerInfo = await getUserInfo(order.customer_id);
-            if (customerInfo) {
-                const formattedDeadline = new Date(newDeadline).toLocaleDateString('en-US', {
-                    year: 'numeric',
-                    month: 'short',
-                    day: 'numeric'
-                });
-                await sendOrderNotification({
-                    userId: order.customer_id,
-                    title: `📅 Deadline Extension Request`,
-                    body: `${sellerName} requested deadline extension to ${formattedDeadline}`,
-                    type: 'deadline_extension_request',
-                    orderId: orderId,
-                    conversationId: orderId,
-                    actorName: sellerName,
-                    actorId: sellerId,
-                    extraData: {
-                        new_deadline: newDeadline,
-                        reason: reason || '',
-                    }
-                });
-            }
             
         } catch (error) {
             console.error('❌ Error requesting deadline extension:', error);
@@ -1185,12 +920,11 @@ io.on('connection', (socket) => {
         }
     });
     
-    // DEADLINE EXTENSION - Accept
+    // ✅ DEADLINE EXTENSION - Accept
     socket.on('accept_deadline_extension', async (data) => {
         try {
             const { orderId } = data;
             const customerId = socket.data.userId;
-            const customerName = socket.data.userName;
             
             console.log(`✅ Deadline extension accepted for order ${orderId}`);
             
@@ -1228,29 +962,6 @@ io.on('connection', (socket) => {
             });
             
             console.log(`📤 Deadline extension acceptance broadcasted to room: ${roomName}`);
-
-            // ✅ Send push notification to seller
-            const sellerInfo = await getUserInfo(order.seller_id);
-            if (sellerInfo) {
-                const formattedDeadline = new Date(order.pending_deadline).toLocaleDateString('en-US', {
-                    year: 'numeric',
-                    month: 'short',
-                    day: 'numeric'
-                });
-                await sendOrderNotification({
-                    userId: order.seller_id,
-                    title: `✅ Deadline Extension Accepted`,
-                    body: `${customerName} accepted the deadline extension to ${formattedDeadline}`,
-                    type: 'deadline_extension_accepted',
-                    orderId: orderId,
-                    conversationId: orderId,
-                    actorName: customerName,
-                    actorId: customerId,
-                    extraData: {
-                        new_deadline: order.pending_deadline,
-                    }
-                });
-            }
             
         } catch (error) {
             console.error('❌ Error accepting deadline extension:', error);
@@ -1258,12 +969,11 @@ io.on('connection', (socket) => {
         }
     });
     
-    // DEADLINE EXTENSION - Reject
+    // ✅ DEADLINE EXTENSION - Reject
     socket.on('reject_deadline_extension', async (data) => {
         try {
             const { orderId } = data;
             const customerId = socket.data.userId;
-            const customerName = socket.data.userName;
             
             console.log(`❌ Deadline extension rejected for order ${orderId}`);
             
@@ -1299,21 +1009,6 @@ io.on('connection', (socket) => {
             });
             
             console.log(`📤 Deadline extension rejection broadcasted to room: ${roomName}`);
-
-            // ✅ Send push notification to seller
-            const sellerInfo = await getUserInfo(order.seller_id);
-            if (sellerInfo) {
-                await sendOrderNotification({
-                    userId: order.seller_id,
-                    title: `❌ Deadline Extension Rejected`,
-                    body: `${customerName} rejected the deadline extension request`,
-                    type: 'deadline_extension_rejected',
-                    orderId: orderId,
-                    conversationId: orderId,
-                    actorName: customerName,
-                    actorId: customerId,
-                });
-            }
             
         } catch (error) {
             console.error('❌ Error rejecting deadline extension:', error);
@@ -1321,12 +1016,11 @@ io.on('connection', (socket) => {
         }
     });
     
-    // CANCELLATION - Request
+    // ✅ CANCELLATION - Request
     socket.on('request_cancellation', async (data) => {
         try {
             const { orderId, reason, requestedBy } = data;
             const userId = socket.data.userId;
-            const userName = socket.data.userName;
             
             console.log(`🔴 Cancellation requested for order ${orderId} by ${requestedBy}`);
             
@@ -1365,28 +1059,6 @@ io.on('connection', (socket) => {
             });
             
             console.log(`📤 Cancellation request broadcasted to room: ${roomName}`);
-
-            // ✅ Send push notification to the other party
-            const otherUserId = userId === order.customer_id ? order.seller_id : order.customer_id;
-            const otherUserInfo = await getUserInfo(otherUserId);
-            const requestedByLabel = requestedBy === 'customer' ? 'Customer' : 'Seller';
-            
-            if (otherUserInfo) {
-                await sendOrderNotification({
-                    userId: otherUserId,
-                    title: `🔴 Cancellation Request`,
-                    body: `${requestedByLabel} requested to cancel the order. Reason: ${reason || 'No reason provided'}`,
-                    type: 'cancellation_request',
-                    orderId: orderId,
-                    conversationId: orderId,
-                    actorName: userName,
-                    actorId: userId,
-                    extraData: {
-                        reason: reason || '',
-                        requested_by: requestedBy,
-                    }
-                });
-            }
             
         } catch (error) {
             console.error('❌ Error requesting cancellation:', error);
@@ -1394,12 +1066,11 @@ io.on('connection', (socket) => {
         }
     });
     
-    // CANCELLATION - Accept
+    // ✅ CANCELLATION - Accept
     socket.on('accept_cancellation', async (data) => {
         try {
             const { orderId } = data;
             const userId = socket.data.userId;
-            const userName = socket.data.userName;
             
             console.log(`✅ Cancellation accepted for order ${orderId}`);
             
@@ -1435,23 +1106,6 @@ io.on('connection', (socket) => {
             });
             
             console.log(`📤 Cancellation acceptance broadcasted to room: ${roomName}`);
-
-            // ✅ Send push notification to the other party
-            const otherUserId = userId === order.customer_id ? order.seller_id : order.customer_id;
-            const otherUserInfo = await getUserInfo(otherUserId);
-            
-            if (otherUserInfo) {
-                await sendOrderNotification({
-                    userId: otherUserId,
-                    title: `✅ Cancellation Accepted`,
-                    body: `${userName} accepted the cancellation request. The order has been cancelled.`,
-                    type: 'cancellation_accepted',
-                    orderId: orderId,
-                    conversationId: orderId,
-                    actorName: userName,
-                    actorId: userId,
-                });
-            }
             
         } catch (error) {
             console.error('❌ Error accepting cancellation:', error);
@@ -1459,12 +1113,11 @@ io.on('connection', (socket) => {
         }
     });
     
-    // CANCELLATION - Reject
+    // ✅ CANCELLATION - Reject
     socket.on('reject_cancellation', async (data) => {
         try {
             const { orderId } = data;
             const userId = socket.data.userId;
-            const userName = socket.data.userName;
             
             console.log(`❌ Cancellation rejected for order ${orderId}`);
             
@@ -1499,23 +1152,6 @@ io.on('connection', (socket) => {
             });
             
             console.log(`📤 Cancellation rejection broadcasted to room: ${roomName}`);
-
-            // ✅ Send push notification to the other party
-            const otherUserId = userId === order.customer_id ? order.seller_id : order.customer_id;
-            const otherUserInfo = await getUserInfo(otherUserId);
-            
-            if (otherUserInfo) {
-                await sendOrderNotification({
-                    userId: otherUserId,
-                    title: `❌ Cancellation Rejected`,
-                    body: `${userName} rejected the cancellation request. The order will continue.`,
-                    type: 'cancellation_rejected',
-                    orderId: orderId,
-                    conversationId: orderId,
-                    actorName: userName,
-                    actorId: userId,
-                });
-            }
             
         } catch (error) {
             console.error('❌ Error rejecting cancellation:', error);
@@ -1523,13 +1159,14 @@ io.on('connection', (socket) => {
         }
     });
     
-    // CONTACT SUPPORT
+    // ✅ CONTACT SUPPORT
     socket.on('contact_support', async (data) => {
         try {
             const { orderId, message, userId } = data;
             
             console.log(`🆘 Support requested for order ${orderId}`);
             
+            // Save support request
             await pool.query(
                 `INSERT INTO support_requests (order_id, user_id, message, status, created_at) 
                 VALUES (?, ?, ?, 'pending', NOW())`,
@@ -1544,78 +1181,10 @@ io.on('connection', (socket) => {
             });
             
             console.log(`📤 Support request broadcasted to room: ${roomName}`);
-
-            // ✅ Send push notification to admin/support (not implemented in this example)
-            // You could add admin push tokens here
             
         } catch (error) {
             console.error('❌ Error contacting support:', error);
             socket.emit('error', { message: 'Failed to contact support' });
-        }
-    });
-    
-    // STATUS UPDATE - Order status changed
-    socket.on('order_status_updated', async (data) => {
-        try {
-            const { orderId, status, oldStatus } = data;
-            const userId = socket.data.userId;
-            const userName = socket.data.userName;
-            
-            console.log(`📋 Order ${orderId} status changed from ${oldStatus} to ${status}`);
-            
-            const [orderRows] = await pool.query(
-                'SELECT customer_id, seller_id FROM work_orders WHERE id = ?',
-                [orderId]
-            );
-            
-            if (orderRows.length === 0) {
-                return;
-            }
-            
-            const order = orderRows[0];
-            
-            const statusLabels = {
-                'accepted': 'Accepted',
-                'in_progress': 'Started',
-                'delivered': 'Delivered',
-                'completed': 'Completed',
-                'cancelled': 'Cancelled'
-            };
-            
-            const statusEmojis = {
-                'accepted': '✅',
-                'in_progress': '🔄',
-                'delivered': '📦',
-                'completed': '🎉',
-                'cancelled': '❌'
-            };
-            
-            const statusLabel = statusLabels[status] || status;
-            const statusEmoji = statusEmojis[status] || '📋';
-            
-            // Send notification to the other party
-            const otherUserId = userId === order.customer_id ? order.seller_id : order.customer_id;
-            const otherUserInfo = await getUserInfo(otherUserId);
-            
-            if (otherUserInfo) {
-                await sendOrderNotification({
-                    userId: otherUserId,
-                    title: `${statusEmoji} Order ${statusLabel}`,
-                    body: `${userName} updated the order status to ${statusLabel}`,
-                    type: 'order_status_updated',
-                    orderId: orderId,
-                    conversationId: orderId,
-                    actorName: userName,
-                    actorId: userId,
-                    extraData: {
-                        status: status,
-                        old_status: oldStatus || '',
-                    }
-                });
-            }
-            
-        } catch (error) {
-            console.error('❌ Error sending status update notification:', error);
         }
     });
     
@@ -1635,10 +1204,7 @@ io.on('connection', (socket) => {
     });
 });
 
-// ============================================
-// ✅ DATABASE FUNCTIONS
-// ============================================
-
+// ✅ DATABASE FUNCTIONS with error handling
 async function getChatHistory(conversationId, limit = 50, offset = 0) {
     if (!pool) return [];
     
@@ -1778,20 +1344,17 @@ async function startServer() {
         console.log(`   - /debug/conversations`);
         console.log(`   - /debug/conversation/:id`);
         console.log(`   - /debug/messages/:conversationId`);
-        console.log(`📋 Order Management Events with Push Notifications:`);
-        console.log(`   - request_price_change → Push to customer`);
-        console.log(`   - accept_price_change → Push to seller`);
-        console.log(`   - reject_price_change → Push to seller`);
-        console.log(`   - request_deadline_extension → Push to customer`);
-        console.log(`   - accept_deadline_extension → Push to seller`);
-        console.log(`   - reject_deadline_extension → Push to seller`);
-        console.log(`   - request_cancellation → Push to other party`);
-        console.log(`   - accept_cancellation → Push to other party`);
-        console.log(`   - reject_cancellation → Push to other party`);
-        console.log(`   - send_message → Push to other user`);
-        console.log(`   - send_offer → Push to other user`);
-        console.log(`   - offer_updated → Push to other user`);
-        console.log(`   - contact_support → Push to admin`);
+        console.log(`📋 Order Management Events:`);
+        console.log(`   - request_price_change`);
+        console.log(`   - accept_price_change`);
+        console.log(`   - reject_price_change`);
+        console.log(`   - request_deadline_extension`);
+        console.log(`   - accept_deadline_extension`);
+        console.log(`   - reject_deadline_extension`);
+        console.log(`   - request_cancellation`);
+        console.log(`   - accept_cancellation`);
+        console.log(`   - reject_cancellation`);
+        console.log(`   - contact_support`);
     });
 }
 
