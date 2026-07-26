@@ -803,6 +803,7 @@ io.on('connection', (socket) => {
                 `UPDATE work_orders 
                 SET pending_price = NULL, 
                     price_change_status = 'accepted',
+                    cancellation_requested_by = NULL,
                     updated_at = NOW() 
                 WHERE id = ?`,
                 [orderId]
@@ -851,6 +852,7 @@ io.on('connection', (socket) => {
                 `UPDATE work_orders 
                 SET pending_price = NULL, 
                     price_change_status = 'rejected',
+                    cancellation_requested_by = NULL,
                     updated_at = NOW() 
                 WHERE id = ?`,
                 [orderId]
@@ -899,9 +901,10 @@ io.on('connection', (socket) => {
                 SET pending_deadline = ?, 
                     deadline_extension_reason = ?, 
                     deadline_extension_status = 'pending',
+                    cancellation_requested_by = ?,
                     updated_at = NOW() 
                 WHERE id = ?`,
-                [newDeadline, reason, orderId]
+                [newDeadline, reason, 'seller', orderId]
             );
             
             const roomName = `chat_${orderId}`;
@@ -921,7 +924,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    // ✅ DEADLINE EXTENSION - Accept
+    // ✅ DEADLINE EXTENSION - Accept - FIXED (removed delivery_date update)
     socket.on('accept_deadline_extension', async (data) => {
         try {
             const { orderId } = data;
@@ -945,14 +948,16 @@ io.on('connection', (socket) => {
                 return;
             }
             
+            // ✅ FIX: ONLY update status, NOT delivery_date
+            // The delivery_date and pending_deadline are already updated by update-order-deadline.php
             await pool.query(
                 `UPDATE work_orders 
-                SET delivery_date = ?, 
-                    pending_deadline = NULL, 
+                SET pending_deadline = NULL, 
                     deadline_extension_status = 'accepted',
+                    cancellation_requested_by = NULL,
                     updated_at = NOW() 
                 WHERE id = ?`,
-                [order.pending_deadline, orderId]
+                [orderId]
             );
             
             const roomName = `chat_${orderId}`;
@@ -970,7 +975,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    // ✅ DEADLINE EXTENSION - Reject
+    // ✅ DEADLINE EXTENSION - Reject - FIXED
     socket.on('reject_deadline_extension', async (data) => {
         try {
             const { orderId } = data;
@@ -994,10 +999,12 @@ io.on('connection', (socket) => {
                 return;
             }
             
+            // ✅ FIX: ONLY update status
             await pool.query(
                 `UPDATE work_orders 
                 SET pending_deadline = NULL, 
                     deadline_extension_status = 'rejected',
+                    cancellation_requested_by = NULL,
                     updated_at = NOW() 
                 WHERE id = ?`,
                 [orderId]
@@ -1067,7 +1074,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    // ✅ CANCELLATION - Accept
+    // ✅ CANCELLATION - Accept - FIXED (removed status='cancelled' update)
     socket.on('accept_cancellation', async (data) => {
         try {
             const { orderId } = data;
@@ -1091,10 +1098,12 @@ io.on('connection', (socket) => {
                 return;
             }
             
+            // ✅ FIX: ONLY update cancellation_status
+            // The status='cancelled' is already updated by update-order-cancellation.php
             await pool.query(
                 `UPDATE work_orders 
-                SET status = 'cancelled', 
-                    cancellation_status = 'accepted',
+                SET cancellation_status = 'accepted',
+                    cancellation_requested_by = NULL,
                     updated_at = NOW() 
                 WHERE id = ?`,
                 [orderId]
@@ -1141,6 +1150,7 @@ io.on('connection', (socket) => {
             await pool.query(
                 `UPDATE work_orders 
                 SET cancellation_status = 'rejected',
+                    cancellation_requested_by = NULL,
                     updated_at = NOW() 
                 WHERE id = ?`,
                 [orderId]
