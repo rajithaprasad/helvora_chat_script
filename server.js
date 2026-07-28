@@ -294,7 +294,7 @@ io.on('connection', (socket) => {
     });
 
     // ============================================
-    // ✅ CHAT EVENTS - FIXED WITH PROPER BROADCASTING
+    // ✅ CHAT EVENTS - FIXED
     // ============================================
     
     // ✅ JOIN CHAT ROOM
@@ -331,14 +331,16 @@ io.on('connection', (socket) => {
         });
     });
 
-    // ✅ SEND MESSAGE - FIXED BROADCASTING
+    // ✅ SEND MESSAGE - FIXED: This must be registered!
     socket.on('send_message', async (data) => {
+        console.log('📨📨📨 SEND_MESSAGE EVENT RECEIVED!', data);
         try {
             const { conversationId, content, messageType = 'text', attachment_id } = data;
             
             console.log(`📨 send_message: conversationId=${conversationId}, content=${content?.substring(0, 30)}...`);
             
             if (!conversationId) {
+                console.error('❌ Missing conversationId');
                 socket.emit('error', { message: 'Missing conversationId' });
                 return;
             }
@@ -366,9 +368,13 @@ io.on('connection', (socket) => {
             const roomName = `chat_${conversationId}`;
             io.to(roomName).emit('new_message', messageData);
             
-            console.log(`📤 Message broadcasted to room: ${roomName}`);
+            console.log(`📤 Message broadcasted to room: ${roomName} with ID: ${messageData.id}`);
 
-            // ✅ Try to save to database if available (don't block)
+            // ✅ Also send directly back to sender (to ensure they see it)
+            socket.emit('new_message', messageData);
+            console.log(`📤 Message sent back to sender: ${senderId}`);
+
+            // ✅ Try to save to database if available
             if (pool) {
                 try {
                     const [convRows] = await pool.query(
@@ -569,7 +575,7 @@ io.on('connection', (socket) => {
                 return;
             }
             
-            // Send push notification (NO database)
+            // Send push notification
             const pushUrl = 'https://helvora.app/api_app/send-push-notification.php';
             const pushData = {
                 customer_id: customerId,
@@ -956,13 +962,13 @@ async function startServer() {
         console.log(`📋 Features:`);
         console.log(`   💬 Chat System (REAL-TIME):`);
         console.log(`      - join_chat`);
-        console.log(`      - send_message (broadcasts to room)`);
+        console.log(`      - send_message (BROADCASTS to room + sender)`);
         console.log(`      - typing`);
         console.log(`      - mark_read`);
         console.log(`      - new_file_uploaded`);
         console.log(`      - send_offer`);
         console.log(`      - offer_updated`);
-        console.log(`   📦 Order Broadcasting (NO Database):`);
+        console.log(`   📦 Order Broadcasting:`);
         console.log(`      - request_order`);
         console.log(`      - accept_order_request`);
         console.log(`      - decline_order_request`);
