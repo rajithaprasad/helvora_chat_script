@@ -84,7 +84,6 @@ async function callPhpWithRetry(url, data, maxRetries = 3) {
             console.error(`❌ PHP call attempt ${attempt} failed:`, error.message);
             
             if (attempt < maxRetries) {
-                // Wait before retrying (exponential backoff)
                 const delay = attempt * 1000;
                 console.log(`⏳ Waiting ${delay}ms before retry...`);
                 await new Promise(resolve => setTimeout(resolve, delay));
@@ -702,7 +701,7 @@ io.on('connection', (socket) => {
     // ✅ ORDER BROADCASTING EVENTS
     // ============================================
 
-    // ✅ ORDER REQUEST - Customer to Seller (NO DATABASE)
+    // ✅ ORDER REQUEST - Customer to Seller (Push Notification ONLY - NO Database)
     socket.on('request_order', async (data) => {
         try {
             const { 
@@ -734,6 +733,33 @@ io.on('connection', (socket) => {
                 return;
             }
             
+            // ✅ Send push notification ONLY (NO database save)
+            const pushUrl = 'https://helvora.app/api_app/send-push-notification.php';
+            const pushData = {
+                customer_id: customerId,
+                seller_id: sellerId,
+                service_id: serviceId || 1,
+                service_name: serviceName || 'Service',
+                quantity: quantity || 1,
+                total_price: totalPrice || 0,
+                notes: notes || '',
+                customer_name: customerName || 'Customer',
+                delivery_date: deliveryDate || null,
+                save_to_database: false  // ✅ Don't save to database
+            };
+            
+            console.log('📤 Sending push notification to seller...');
+            const pushResult = await callPhpWithRetry(pushUrl, pushData);
+            
+            if (!pushResult.success) {
+                console.log(`⚠️ Push notification failed: ${pushResult.error}`);
+                // Continue anyway - WebSocket will still work
+            } else {
+                console.log(`📱 Push notification sent: ${pushResult.notification_sent}`);
+                console.log(`📱 Tokens found: ${pushResult.tokens_found}`);
+            }
+            
+            // ✅ Generate order ID for WebSocket tracking (NO database)
             const orderId = `order_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
             const timestamp = new Date().toISOString();
             const expiresAt = new Date(Date.now() + 30000);
@@ -763,13 +789,12 @@ io.on('connection', (socket) => {
                 status: 'pending'
             });
             
-            // ✅ Check if seller is connected
+            // ✅ Check if seller is connected and send WebSocket broadcast
             const sellerSocketId = userSockets.get(sellerId);
             const isSellerConnected = sellerSocketId ? true : false;
             
             console.log(`🔍 Seller ${sellerId} connected: ${isSellerConnected}`);
             
-            // ✅ Try to send directly to seller's socket
             if (isSellerConnected && sellerSocketId) {
                 const sellerSocket = io.sockets.sockets.get(sellerSocketId);
                 if (sellerSocket && sellerSocket.connected) {
@@ -790,7 +815,7 @@ io.on('connection', (socket) => {
                 }
             } else {
                 console.log(`❌ Seller ${sellerId} is NOT connected!`);
-                console.log(`📤 No direct delivery possible`);
+                console.log(`📤 Push notification already sent (if tokens exist)`);
             }
             
             // ✅ Confirm to customer
@@ -822,9 +847,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    // ============================================
-    // ✅ ACCEPT ORDER REQUEST - With retry
-    // ============================================
+    // ✅ ACCEPT ORDER REQUEST - Creates DB record + Accepts
     socket.on('accept_order_request', async (data) => {
         try {
             const { orderId, sellerId } = data;
@@ -857,7 +880,7 @@ io.on('connection', (socket) => {
                 return;
             }
             
-            // ✅ Create order in database using PHP with retry
+            // ✅ Save to database on accept (with save_to_database: true)
             const createUrl = 'https://helvora.app/api_app/send-push-notification.php';
             const createData = {
                 customer_id: order.customer_id,
@@ -868,7 +891,8 @@ io.on('connection', (socket) => {
                 total_price: order.total_price,
                 notes: order.notes || '',
                 customer_name: order.customer_name,
-                delivery_date: order.delivery_date
+                delivery_date: order.delivery_date,
+                save_to_database: true  // ✅ Save to database
             };
             
             console.log('📤 Creating order in database...');
@@ -956,9 +980,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    // ============================================
-    // ✅ DECLINE ORDER REQUEST - With retry
-    // ============================================
+    // ✅ DECLINE ORDER REQUEST - Creates DB record + Declines
     socket.on('decline_order_request', async (data) => {
         try {
             const { orderId, sellerId, reason } = data;
@@ -986,7 +1008,7 @@ io.on('connection', (socket) => {
                 return;
             }
             
-            // ✅ Create order in database using PHP with retry
+            // ✅ Save to database on decline (with save_to_database: true)
             const createUrl = 'https://helvora.app/api_app/send-push-notification.php';
             const createData = {
                 customer_id: order.customer_id,
@@ -997,7 +1019,8 @@ io.on('connection', (socket) => {
                 total_price: order.total_price,
                 notes: order.notes || '',
                 customer_name: order.customer_name,
-                delivery_date: order.delivery_date
+                delivery_date: order.delivery_date,
+                save_to_database: true  // ✅ Save to database
             };
             
             console.log('📤 Creating order in database...');
@@ -1294,9 +1317,9 @@ async function startServer() {
         console.log(`      - send_offer`);
         console.log(`      - offer_updated`);
         console.log(`   📦 Order Broadcasting:`);
-        console.log(`      - request_order (NO DATABASE)`);
-        console.log(`      - accept_order_request (calls PHP with retry)`);
-        console.log(`      - decline_order_request (calls PHP with retry)`);
+        console.log(`      - request_order (Push Notification ONLY - NO Database)`);
+        console.log(`      - accept_order_request (Creates DB + Accepts)`);
+        console.log(`      - decline_order_request (Creates DB + Declines)`);
         console.log(`      - order_expired`);
         console.log(`   ⏰ Auto-expiry after 30 seconds`);
         console.log(`   🔄 PHP retry: 3 attempts with exponential backoff`);
