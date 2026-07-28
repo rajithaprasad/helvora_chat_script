@@ -62,7 +62,9 @@ app.get('/', (req, res) => {
             websocket: 'wss://' + req.get('host'),
             pending_orders: '/debug/pending-orders',
             rooms: '/debug/rooms',
-            connections: '/debug/connections'
+            connections: '/debug/connections',
+            user: '/debug/user/:userId',
+            simulate: '/debug/simulate-order'
         }
     });
 });
@@ -143,6 +145,40 @@ app.get('/debug/connections', (req, res) => {
         success: true,
         totalConnections: connections.length,
         connections: connections
+    });
+});
+
+// ✅ DEBUG: Check if specific user is connected
+app.get('/debug/user/:userId', (req, res) => {
+    const { userId } = req.params;
+    const socketId = userSockets.get(parseInt(userId));
+    const isConnected = socketId ? true : false;
+    
+    res.json({
+        success: true,
+        userId: parseInt(userId),
+        isConnected: isConnected,
+        socketId: socketId || null,
+        totalConnections: userSockets.size,
+        connectedUsers: Array.from(userSockets.keys())
+    });
+});
+
+// ✅ DEBUG: Simulate order request (for testing)
+app.post('/debug/simulate-order', (req, res) => {
+    const { customerId = 6, sellerId = 8, serviceName = 'Test Service' } = req.body;
+    
+    console.log(`🧪 Simulating order from ${customerId} to seller ${sellerId}`);
+    
+    const sellerSocketId = userSockets.get(sellerId);
+    const isSellerConnected = sellerSocketId ? true : false;
+    
+    res.json({
+        success: true,
+        message: 'Order simulation triggered',
+        sellerConnected: isSellerConnected,
+        sellerSocketId: sellerSocketId || null,
+        connectedUsers: Array.from(userSockets.keys())
     });
 });
 
@@ -248,8 +284,15 @@ io.on('connection', (socket) => {
                 deliveryDate
             } = data;
             
-            console.log(`📦 Order request from ${customerId} to seller ${sellerId}: ${serviceName}`);
-            console.log(`📊 Connected users:`, Array.from(userSockets.keys()));
+            console.log('========================================');
+            console.log(`📦 ORDER REQUEST DEBUG`);
+            console.log(`   Customer: ${customerId}`);
+            console.log(`   Seller: ${sellerId}`);
+            console.log(`   Service: ${serviceName}`);
+            console.log(`   All connected users:`, Array.from(userSockets.keys()));
+            console.log(`   User ${sellerId} connected? ${userSockets.has(sellerId) ? 'YES' : 'NO'}`);
+            console.log(`   User ${sellerId} socket: ${userSockets.get(sellerId) || 'N/A'}`);
+            console.log('========================================');
             
             if (!customerId || !sellerId || !serviceId) {
                 socket.emit('error', { 
@@ -292,7 +335,8 @@ io.on('connection', (socket) => {
             const sellerSocketId = userSockets.get(sellerId);
             const isSellerConnected = sellerSocketId ? true : false;
             
-            console.log(`🔍 Seller ${sellerId} connected: ${isSellerConnected} (socket: ${sellerSocketId || 'N/A'})`);
+            console.log(`🔍 Seller ${sellerId} connected: ${isSellerConnected}`);
+            console.log(`   Socket ID: ${sellerSocketId || 'N/A'}`);
             
             // ✅ Try to send directly to seller's socket
             if (isSellerConnected && sellerSocketId) {
@@ -302,26 +346,73 @@ io.on('connection', (socket) => {
                         ...orderData,
                         timeRemaining: 30
                     });
-                    console.log(`📤 Directly sent to seller ${sellerId} (socket: ${sellerSocketId})`);
+                    console.log(`📤 Directly sent to seller ${sellerId} ✅`);
                 } else {
-                    // Socket exists but is disconnected - remove from mapping
+                    console.log(`⚠️ Seller socket exists but not connected`);
                     userSockets.delete(sellerId);
-                    console.log(`⚠️ Seller ${sellerId} socket disconnected, removed from mapping`);
-                    
-                    // Fallback: broadcast to room
                     const sellerRoom = `user_${sellerId}`;
                     io.to(sellerRoom).emit('order_request_received', {
                         ...orderData,
                         timeRemaining: 30
                     });
-                    console.log(`📤 Broadcasted to seller room: ${sellerRoom} (fallback)`);
+                    console.log(`📤 Broadcasted to room: ${sellerRoom} (fallback)`);
                 }
             } else {
-                // Seller not connected - broadcast to room anyway
-                const sellerRoom = `user_${sellerId}`;
-                const roomSockets = await io.in(sellerRoom).fetchSockets();
-                console.log(`📊 Room ${sellerRoom} has ${roomSockets.length} connected clients`);
+                console.log(`❌ Seller ${sellerId} is NOT connected!`);
+                console.log(`📤 No direct delivery possible`);
                 
+                // ✅ IMPORTANT: Send push notification when seller is offline
+                if (pool) {
+                    try {
+                        console.log(`📱 Attempting to send push notification to seller ${sellerId}`);
+                        
+                        const [tokenRows] = await pool.query(
+                            'SELECT token FROM push_tokens WHERE user_id = ?',
+                            [sellerId]
+                        );
+                        
+                        if (tokenRows && tokenRows.length > 0) {
+                            const pushTokens = tokenRows.map(row => row.token);
+                            
+                            console.log(`📱 Found ${pushTokens.length} push tokens for seller ${sellerId}`);
+                            
+                            const expoResponse = await fetch('https://exp.host/--/api/v2/push/send', {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'Accept': 'application/json',
+                                },
+                                body: JSON.stringify(pushTokens.map(token => ({
+                                    to: token,
+                                    sound: 'notification',
+                                    title: 'New Order Request!',
+                                    body: `${customerName || 'Customer'} requested: ${serviceName || 'Service'}`,
+                                    priority: 'high',
+                                    data: {
+                                        type: 'order_request',
+                                        order_id: orderId,
+                                        customer_name: customerName || 'Customer',
+                                        service_name: serviceName || 'Service',
+                                        total_price: totalPrice || 0,
+                                        delivery_date: deliveryDate || '',
+                                        seller_id: sellerId,
+                                    },
+                                    channelId: 'order_notifications',
+                                }))),
+                            });
+                            
+                            const expoResult = await expoResponse.json();
+                            console.log(`📱 Push notification result:`, expoResult);
+                        } else {
+                            console.log(`⚠️ No push tokens found for seller ${sellerId}`);
+                        }
+                    } catch (error) {
+                        console.error('❌ Error sending push notification:', error);
+                    }
+                }
+                
+                // ✅ Also broadcast to room (in case seller connects later)
+                const sellerRoom = `user_${sellerId}`;
                 io.to(sellerRoom).emit('order_request_received', {
                     ...orderData,
                     timeRemaining: 30
@@ -348,6 +439,7 @@ io.on('connection', (socket) => {
             
             console.log(`📦 Order ${orderId} stored in memory, expires at ${expiresAt.toISOString()}`);
             console.log(`📊 Total pending orders: ${pendingOrders.size}`);
+            console.log('========================================');
             
         } catch (error) {
             console.error('❌ Error broadcasting order request:', error);
@@ -419,7 +511,6 @@ io.on('connection', (socket) => {
             
             console.log(`✅ Seller ${sellerId} accepting order ${orderId}`);
             
-            // ✅ Get order from memory
             const order = pendingOrders.get(orderId);
             if (!order) {
                 socket.emit('error', { message: 'Order not found or expired' });
@@ -448,8 +539,6 @@ io.on('connection', (socket) => {
             
             // ✅ Save to database via PHP
             const phpUrl = 'https://helvora.app/api_app/update-order-status.php';
-            
-            // Extract numeric order ID from the order_xxx format
             const numericOrderId = parseInt(orderId.split('_')[1] || orderId);
             
             try {
@@ -474,13 +563,11 @@ io.on('connection', (socket) => {
                 console.log('📥 PHP accept response:', result);
                 
                 if (result.success) {
-                    // ✅ Update order in memory
                     order.status = 'accepted';
                     order.work_order_id = result.work_order?.id || null;
                     order.accepted_at = new Date().toISOString();
                     pendingOrders.set(orderId, order);
                     
-                    // ✅ Cancel timeout
                     if (orderTimeouts.has(orderId)) {
                         clearTimeout(orderTimeouts.get(orderId));
                         orderTimeouts.delete(orderId);
@@ -511,7 +598,6 @@ io.on('connection', (socket) => {
                         message: 'Order accepted successfully'
                     });
                     
-                    // ✅ Clean up after 5 seconds
                     setTimeout(() => {
                         if (pendingOrders.has(orderId)) {
                             pendingOrders.delete(orderId);
@@ -569,10 +655,7 @@ io.on('connection', (socket) => {
                 return;
             }
             
-            // ✅ Save to database via PHP
             const phpUrl = 'https://helvora.app/api_app/update-order-status.php';
-            
-            // Extract numeric order ID
             const numericOrderId = parseInt(orderId.split('_')[1] || orderId);
             
             try {
@@ -593,14 +676,12 @@ io.on('connection', (socket) => {
                 console.log('📥 PHP decline response:', result);
                 
                 if (result.success) {
-                    // ✅ Remove from memory
                     pendingOrders.delete(orderId);
                     if (orderTimeouts.has(orderId)) {
                         clearTimeout(orderTimeouts.get(orderId));
                         orderTimeouts.delete(orderId);
                     }
                     
-                    // ✅ Broadcast to customer
                     const customerRoom = `user_${order.customer_id}`;
                     io.to(customerRoom).emit('order_request_declined', {
                         order_id: orderId,
@@ -610,7 +691,6 @@ io.on('connection', (socket) => {
                         declined_at: new Date().toISOString()
                     });
                     
-                    // ✅ Notify seller
                     const sellerRoom = `user_${sellerId}`;
                     io.to(sellerRoom).emit('order_decline_confirmed', {
                         order_id: orderId,
@@ -654,14 +734,12 @@ io.on('connection', (socket) => {
             const order = pendingOrders.get(orderId);
             if (!order) return;
             
-            // ✅ Remove from memory
             pendingOrders.delete(orderId);
             if (orderTimeouts.has(orderId)) {
                 clearTimeout(orderTimeouts.get(orderId));
                 orderTimeouts.delete(orderId);
             }
             
-            // ✅ Broadcast to both parties
             const customerRoom = `user_${order.customer_id}`;
             io.to(customerRoom).emit('order_request_expired', {
                 order_id: orderId,
@@ -814,7 +892,6 @@ io.on('connection', (socket) => {
         console.log(`🔴 User disconnected: ${userId}`);
         console.log(`📊 Active connections: ${io.engine.clientsCount}`);
         
-        // ✅ Remove from userSockets mapping
         if (userSockets.get(userId) === socket.id) {
             userSockets.delete(userId);
             console.log(`📌 Removed socket for user ${userId}`);
@@ -849,7 +926,6 @@ function checkOrderExpiry(orderId) {
             orderTimeouts.delete(orderId);
         }
         
-        // ✅ Notify customer
         const customerRoom = `user_${order.customer_id}`;
         io.to(customerRoom).emit('order_request_expired', {
             order_id: orderId,
@@ -857,7 +933,6 @@ function checkOrderExpiry(orderId) {
             expired_at: new Date().toISOString()
         });
         
-        // ✅ Notify seller
         const sellerRoom = `user_${order.seller_id}`;
         io.to(sellerRoom).emit('order_request_expired', {
             order_id: orderId,
@@ -989,12 +1064,15 @@ async function startServer() {
         console.log(`   ❌ decline_order_request - Seller declines (calls PHP)`);
         console.log(`   🔍 check_pending_order - Check order status (from memory)`);
         console.log(`   ⏰ Auto-expiry after 30 seconds`);
+        console.log(`   📱 Push notifications when seller offline`);
         console.log(`📊 Pending orders in memory: 0`);
         console.log(`🔍 Debug endpoints:`);
-        console.log(`   - /debug/pending-orders`);
-        console.log(`   - /debug/pending-order/:id`);
-        console.log(`   - /debug/rooms`);
-        console.log(`   - /debug/connections`);
+        console.log(`   - GET /debug/pending-orders`);
+        console.log(`   - GET /debug/pending-order/:id`);
+        console.log(`   - GET /debug/rooms`);
+        console.log(`   - GET /debug/connections`);
+        console.log(`   - GET /debug/user/:userId`);
+        console.log(`   - POST /debug/simulate-order`);
     });
 }
 
