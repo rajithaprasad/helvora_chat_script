@@ -48,6 +48,54 @@ const orderTimeouts = new Map();
 const userSockets = new Map();
 
 // ============================================
+// ✅ HELPER: Call PHP with retry
+// ============================================
+async function callPhpWithRetry(url, data, maxRetries = 3) {
+    let lastError = null;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            console.log(`📡 PHP call attempt ${attempt}/${maxRetries} to ${url}`);
+            
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 second timeout
+            
+            const response = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(data),
+                signal: controller.signal
+            });
+            
+            clearTimeout(timeoutId);
+            
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+            
+            const result = await response.json();
+            console.log(`📥 PHP response (attempt ${attempt}):`, result);
+            return result;
+            
+        } catch (error) {
+            lastError = error;
+            console.error(`❌ PHP call attempt ${attempt} failed:`, error.message);
+            
+            if (attempt < maxRetries) {
+                // Wait before retrying (exponential backoff)
+                const delay = attempt * 1000;
+                console.log(`⏳ Waiting ${delay}ms before retry...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
+        }
+    }
+    
+    throw lastError;
+}
+
+// ============================================
 // ✅ HEALTH CHECK ENDPOINTS
 // ============================================
 app.get('/', (req, res) => {
@@ -774,7 +822,9 @@ io.on('connection', (socket) => {
         }
     });
 
-    // ✅ ACCEPT ORDER REQUEST - Uses existing PHP
+    // ============================================
+    // ✅ ACCEPT ORDER REQUEST - With retry
+    // ============================================
     socket.on('accept_order_request', async (data) => {
         try {
             const { orderId, sellerId } = data;
@@ -807,29 +857,22 @@ io.on('connection', (socket) => {
                 return;
             }
             
-            // ✅ Use existing PHP: send-push-notification.php
+            // ✅ Create order in database using PHP with retry
             const createUrl = 'https://helvora.app/api_app/send-push-notification.php';
+            const createData = {
+                customer_id: order.customer_id,
+                seller_id: order.seller_id,
+                service_id: order.service_id || 1,
+                service_name: order.service_name,
+                quantity: order.quantity || 1,
+                total_price: order.total_price,
+                notes: order.notes || '',
+                customer_name: order.customer_name,
+                delivery_date: order.delivery_date
+            };
             
-            const createResponse = await fetch(createUrl, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    customer_id: order.customer_id,
-                    seller_id: order.seller_id,
-                    service_id: order.service_id || 1,
-                    service_name: order.service_name,
-                    quantity: order.quantity || 1,
-                    total_price: order.total_price,
-                    notes: order.notes || '',
-                    customer_name: order.customer_name,
-                    delivery_date: order.delivery_date
-                })
-            });
-            
-            const createResult = await createResponse.json();
-            console.log('📥 Create order response:', createResult);
+            console.log('📤 Creating order in database...');
+            const createResult = await callPhpWithRetry(createUrl, createData);
             
             if (!createResult.success) {
                 socket.emit('error', { 
@@ -839,25 +882,21 @@ io.on('connection', (socket) => {
             }
             
             const dbOrderId = createResult.order_id;
+            console.log(`✅ Order created in database with ID: ${dbOrderId}`);
             
-            // ✅ Now accept using update-order-status.php
+            // ✅ Accept the order
             const acceptUrl = 'https://helvora.app/api_app/update-order-status.php';
-            const acceptResponse = await fetch(acceptUrl, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    order_id: dbOrderId,
-                    status: 'accepted',
-                    seller_id: sellerId
-                })
-            });
+            const acceptData = {
+                order_id: dbOrderId,
+                status: 'accepted',
+                seller_id: sellerId
+            };
             
-            const acceptResult = await acceptResponse.json();
-            console.log('📥 Accept response:', acceptResult);
+            console.log('📤 Accepting order in database...');
+            const acceptResult = await callPhpWithRetry(acceptUrl, acceptData);
             
             if (acceptResult.success) {
+                // ✅ Update order in memory
                 order.status = 'accepted';
                 order.db_order_id = dbOrderId;
                 order.accepted_at = new Date().toISOString();
@@ -868,6 +907,7 @@ io.on('connection', (socket) => {
                     orderTimeouts.delete(orderId);
                 }
                 
+                // ✅ Broadcast to customer
                 const customerRoom = `user_${order.customer_id}`;
                 io.to(customerRoom).emit('order_request_accepted', {
                     order_id: orderId,
@@ -877,6 +917,7 @@ io.on('connection', (socket) => {
                     accepted_at: new Date().toISOString()
                 });
                 
+                // ✅ Notify seller
                 const sellerRoom = `user_${sellerId}`;
                 io.to(sellerRoom).emit('order_accept_confirmed', {
                     order_id: orderId,
@@ -891,6 +932,9 @@ io.on('connection', (socket) => {
                     message: 'Order accepted successfully'
                 });
                 
+                console.log(`✅ Order ${orderId} accepted successfully`);
+                
+                // ✅ Clean up after 5 seconds
                 setTimeout(() => {
                     if (pendingOrders.has(orderId)) {
                         pendingOrders.delete(orderId);
@@ -907,12 +951,14 @@ io.on('connection', (socket) => {
         } catch (error) {
             console.error('❌ Error accepting order:', error);
             socket.emit('error', { 
-                message: 'Failed to accept order: ' + error.message 
+                message: 'Failed to accept order. Please try again.' 
             });
         }
     });
 
-    // ✅ DECLINE ORDER REQUEST - Uses existing PHP
+    // ============================================
+    // ✅ DECLINE ORDER REQUEST - With retry
+    // ============================================
     socket.on('decline_order_request', async (data) => {
         try {
             const { orderId, sellerId, reason } = data;
@@ -940,29 +986,22 @@ io.on('connection', (socket) => {
                 return;
             }
             
-            // ✅ Use existing PHP: send-push-notification.php
+            // ✅ Create order in database using PHP with retry
             const createUrl = 'https://helvora.app/api_app/send-push-notification.php';
+            const createData = {
+                customer_id: order.customer_id,
+                seller_id: order.seller_id,
+                service_id: order.service_id || 1,
+                service_name: order.service_name,
+                quantity: order.quantity || 1,
+                total_price: order.total_price,
+                notes: order.notes || '',
+                customer_name: order.customer_name,
+                delivery_date: order.delivery_date
+            };
             
-            const createResponse = await fetch(createUrl, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    customer_id: order.customer_id,
-                    seller_id: order.seller_id,
-                    service_id: order.service_id || 1,
-                    service_name: order.service_name,
-                    quantity: order.quantity || 1,
-                    total_price: order.total_price,
-                    notes: order.notes || '',
-                    customer_name: order.customer_name,
-                    delivery_date: order.delivery_date
-                })
-            });
-            
-            const createResult = await createResponse.json();
-            console.log('📥 Create order response:', createResult);
+            console.log('📤 Creating order in database...');
+            const createResult = await callPhpWithRetry(createUrl, createData);
             
             if (!createResult.success) {
                 socket.emit('error', { 
@@ -972,32 +1011,29 @@ io.on('connection', (socket) => {
             }
             
             const dbOrderId = createResult.order_id;
+            console.log(`✅ Order created in database with ID: ${dbOrderId}`);
             
-            // ✅ Now decline using update-order-status.php
+            // ✅ Decline the order
             const declineUrl = 'https://helvora.app/api_app/update-order-status.php';
-            const declineResponse = await fetch(declineUrl, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    order_id: dbOrderId,
-                    status: 'rejected',
-                    seller_id: sellerId,
-                    reason: reason || 'Seller declined the request'
-                })
-            });
+            const declineData = {
+                order_id: dbOrderId,
+                status: 'rejected',
+                seller_id: sellerId,
+                reason: reason || 'Seller declined the request'
+            };
             
-            const declineResult = await declineResponse.json();
-            console.log('📥 Decline response:', declineResult);
+            console.log('📤 Declining order in database...');
+            const declineResult = await callPhpWithRetry(declineUrl, declineData);
             
             if (declineResult.success) {
+                // ✅ Remove from memory
                 pendingOrders.delete(orderId);
                 if (orderTimeouts.has(orderId)) {
                     clearTimeout(orderTimeouts.get(orderId));
                     orderTimeouts.delete(orderId);
                 }
                 
+                // ✅ Broadcast to customer
                 const customerRoom = `user_${order.customer_id}`;
                 io.to(customerRoom).emit('order_request_declined', {
                     order_id: orderId,
@@ -1008,6 +1044,7 @@ io.on('connection', (socket) => {
                     declined_at: new Date().toISOString()
                 });
                 
+                // ✅ Notify seller
                 const sellerRoom = `user_${sellerId}`;
                 io.to(sellerRoom).emit('order_decline_confirmed', {
                     order_id: orderId,
@@ -1022,6 +1059,8 @@ io.on('connection', (socket) => {
                     message: 'Order declined successfully'
                 });
                 
+                console.log(`✅ Order ${orderId} declined successfully`);
+                
             } else {
                 socket.emit('error', { 
                     message: declineResult.error || 'Failed to decline order' 
@@ -1031,7 +1070,7 @@ io.on('connection', (socket) => {
         } catch (error) {
             console.error('❌ Error declining order:', error);
             socket.emit('error', { 
-                message: 'Failed to decline order: ' + error.message 
+                message: 'Failed to decline order. Please try again.' 
             });
         }
     });
@@ -1256,10 +1295,11 @@ async function startServer() {
         console.log(`      - offer_updated`);
         console.log(`   📦 Order Broadcasting:`);
         console.log(`      - request_order (NO DATABASE)`);
-        console.log(`      - accept_order_request (calls PHP)`);
-        console.log(`      - decline_order_request (calls PHP)`);
+        console.log(`      - accept_order_request (calls PHP with retry)`);
+        console.log(`      - decline_order_request (calls PHP with retry)`);
         console.log(`      - order_expired`);
         console.log(`   ⏰ Auto-expiry after 30 seconds`);
+        console.log(`   🔄 PHP retry: 3 attempts with exponential backoff`);
         console.log(`📊 Pending orders in memory: 0`);
         console.log(`🔍 Debug endpoints available`);
     });
