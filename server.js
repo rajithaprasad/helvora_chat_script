@@ -58,7 +58,7 @@ async function callPhpWithRetry(url, data, maxRetries = 3) {
             console.log(`📡 PHP call attempt ${attempt}/${maxRetries} to ${url}`);
             
             const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 second timeout
+            const timeoutId = setTimeout(() => controller.abort(), 15000);
             
             const response = await fetch(url, {
                 method: 'POST',
@@ -745,7 +745,8 @@ io.on('connection', (socket) => {
                 notes: notes || '',
                 customer_name: customerName || 'Customer',
                 delivery_date: deliveryDate || null,
-                save_to_database: false  // ✅ Don't save to database
+                send_push_notification: true,  // ✅ Send push notification
+                save_to_database: false        // ✅ Don't save to database
             };
             
             console.log('📤 Sending push notification to seller...');
@@ -753,7 +754,6 @@ io.on('connection', (socket) => {
             
             if (!pushResult.success) {
                 console.log(`⚠️ Push notification failed: ${pushResult.error}`);
-                // Continue anyway - WebSocket will still work
             } else {
                 console.log(`📱 Push notification sent: ${pushResult.notification_sent}`);
                 console.log(`📱 Tokens found: ${pushResult.tokens_found}`);
@@ -847,7 +847,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    // ✅ ACCEPT ORDER REQUEST - Creates DB record + Accepts
+    // ✅ ACCEPT ORDER REQUEST - Creates DB record + Accepts (NO PUSH)
     socket.on('accept_order_request', async (data) => {
         try {
             const { orderId, sellerId } = data;
@@ -880,7 +880,7 @@ io.on('connection', (socket) => {
                 return;
             }
             
-            // ✅ Save to database on accept (with save_to_database: true)
+            // ✅ Save to database on accept (WITHOUT push notification)
             const createUrl = 'https://helvora.app/api_app/send-push-notification.php';
             const createData = {
                 customer_id: order.customer_id,
@@ -892,10 +892,11 @@ io.on('connection', (socket) => {
                 notes: order.notes || '',
                 customer_name: order.customer_name,
                 delivery_date: order.delivery_date,
-                save_to_database: true  // ✅ Save to database
+                send_push_notification: false,  // ✅ NO push notification
+                save_to_database: true          // ✅ Save to database
             };
             
-            console.log('📤 Creating order in database...');
+            console.log('📤 Creating order in database (NO PUSH)...');
             const createResult = await callPhpWithRetry(createUrl, createData);
             
             if (!createResult.success) {
@@ -980,7 +981,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    // ✅ DECLINE ORDER REQUEST - Creates DB record + Declines
+    // ✅ DECLINE ORDER REQUEST - Creates DB record + Declines (NO PUSH)
     socket.on('decline_order_request', async (data) => {
         try {
             const { orderId, sellerId, reason } = data;
@@ -1008,7 +1009,7 @@ io.on('connection', (socket) => {
                 return;
             }
             
-            // ✅ Save to database on decline (with save_to_database: true)
+            // ✅ Save to database on decline (WITHOUT push notification)
             const createUrl = 'https://helvora.app/api_app/send-push-notification.php';
             const createData = {
                 customer_id: order.customer_id,
@@ -1020,10 +1021,11 @@ io.on('connection', (socket) => {
                 notes: order.notes || '',
                 customer_name: order.customer_name,
                 delivery_date: order.delivery_date,
-                save_to_database: true  // ✅ Save to database
+                send_push_notification: false,  // ✅ NO push notification
+                save_to_database: true          // ✅ Save to database
             };
             
-            console.log('📤 Creating order in database...');
+            console.log('📤 Creating order in database (NO PUSH)...');
             const createResult = await callPhpWithRetry(createUrl, createData);
             
             if (!createResult.success) {
@@ -1318,8 +1320,8 @@ async function startServer() {
         console.log(`      - offer_updated`);
         console.log(`   📦 Order Broadcasting:`);
         console.log(`      - request_order (Push Notification ONLY - NO Database)`);
-        console.log(`      - accept_order_request (Creates DB + Accepts)`);
-        console.log(`      - decline_order_request (Creates DB + Declines)`);
+        console.log(`      - accept_order_request (Creates DB + Accepts - NO PUSH)`);
+        console.log(`      - decline_order_request (Creates DB + Declines - NO PUSH)`);
         console.log(`      - order_expired`);
         console.log(`   ⏰ Auto-expiry after 30 seconds`);
         console.log(`   🔄 PHP retry: 3 attempts with exponential backoff`);
