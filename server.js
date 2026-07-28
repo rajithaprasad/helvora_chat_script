@@ -16,7 +16,6 @@ try {
     console.log('✅ Database module loaded successfully');
 } catch (error) {
     console.error('❌ Failed to load database module:', error.message);
-    // Create a dummy pool for fallback
     pool = {
         query: async () => { throw new Error('Database not configured'); }
     };
@@ -41,249 +40,564 @@ app.use(cors());
 app.use(helmet());
 app.use(express.json());
 
-// Health check endpoints
+// ============================================
+// ✅ STORE PENDING ORDERS IN MEMORY (NO DATABASE)
+// ============================================
+const pendingOrders = new Map();
+const orderTimeouts = new Map();
+
+// ============================================
+// ✅ HEALTH CHECK ENDPOINTS
+// ============================================
 app.get('/', (req, res) => {
     res.json({
         status: 'ok',
         service: 'Helvora WebSocket Server',
-        version: '1.0.0',
+        version: '2.0.0',
         timestamp: new Date().toISOString(),
+        pending_orders: pendingOrders.size,
         endpoints: {
             health: '/health',
-            test_db: '/test-db',
-            debug_conversations: '/debug/conversations',
-            debug_conversation: '/debug/conversation/:id',
-            websocket: 'wss://' + req.get('host')
+            websocket: 'wss://' + req.get('host'),
+            pending_orders: '/debug/pending-orders'
         }
     });
 });
 
 app.get('/health', async (req, res) => {
-    try {
-        if (pool) {
-            const [result] = await pool.query('SELECT 1 as connected');
-            res.json({
-                status: 'ok',
-                database: 'connected',
-                timestamp: new Date().toISOString(),
-                uptime: process.uptime()
-            });
-        } else {
-            res.json({
-                status: 'ok',
-                database: 'not_configured',
-                timestamp: new Date().toISOString(),
-                uptime: process.uptime()
-            });
-        }
-    } catch (error) {
-        res.status(500).json({
-            status: 'error',
-            database: 'disconnected',
-            error: error.message,
-            timestamp: new Date().toISOString()
-        });
-    }
+    res.json({
+        status: 'ok',
+        pending_orders: pendingOrders.size,
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime()
+    });
 });
 
-app.get('/test-db', async (req, res) => {
-    try {
-        if (!pool) {
-            throw new Error('Database not configured');
-        }
-        const [rows] = await pool.query('SELECT NOW() as server_time, DATABASE() as database_name');
+// ✅ DEBUG: Get all pending orders
+app.get('/debug/pending-orders', (req, res) => {
+    const orders = [];
+    for (const [id, order] of pendingOrders) {
+        orders.push({
+            ...order,
+            expiresAt: order.expiresAt ? order.expiresAt.toISOString() : null,
+            timeRemaining: order.expiresAt ? Math.max(0, Math.floor((order.expiresAt - new Date()) / 1000)) : 0
+        });
+    }
+    res.json({
+        success: true,
+        count: orders.length,
+        orders: orders
+    });
+});
+
+// ✅ DEBUG: Get specific pending order
+app.get('/debug/pending-order/:id', (req, res) => {
+    const { id } = req.params;
+    const order = pendingOrders.get(id);
+    if (!order) {
+        res.json({
+            success: false,
+            message: `Order ${id} not found`
+        });
+    } else {
         res.json({
             success: true,
-            database: process.env.DB_NAME || 'unknown',
-            host: process.env.DB_HOST || 'unknown',
-            time: rows[0].server_time,
-            connection: 'active'
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message,
-            database: process.env.DB_NAME || 'unknown'
+            order: {
+                ...order,
+                expiresAt: order.expiresAt ? order.expiresAt.toISOString() : null,
+                timeRemaining: order.expiresAt ? Math.max(0, Math.floor((order.expiresAt - new Date()) / 1000)) : 0
+            }
         });
     }
 });
 
-// ✅ DEBUG: Get all conversations
-app.get('/debug/conversations', async (req, res) => {
-    try {
-        if (!pool) {
-            throw new Error('Database not configured');
-        }
-        const [rows] = await pool.query('SELECT * FROM conversations ORDER BY id DESC LIMIT 20');
-        res.json({
-            success: true,
-            count: rows.length,
-            conversations: rows
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// ✅ DEBUG: Get specific conversation
-app.get('/debug/conversation/:id', async (req, res) => {
-    try {
-        if (!pool) {
-            throw new Error('Database not configured');
-        }
-        const { id } = req.params;
-        const [rows] = await pool.query('SELECT * FROM conversations WHERE id = ?', [id]);
-        if (rows.length === 0) {
-            res.json({
-                success: false,
-                message: `Conversation ${id} not found`
-            });
-        } else {
-            res.json({
-                success: true,
-                conversation: rows[0]
-            });
-        }
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// ✅ DEBUG: Get messages for a conversation
-app.get('/debug/messages/:conversationId', async (req, res) => {
-    try {
-        if (!pool) {
-            throw new Error('Database not configured');
-        }
-        const { conversationId } = req.params;
-        const [rows] = await pool.query(
-            'SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 50',
-            [conversationId]
-        );
-        res.json({
-            success: true,
-            count: rows.length,
-            messages: rows
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// Socket.io authentication
+// ============================================
+// ✅ SOCKET.IO AUTHENTICATION
+// ============================================
 io.use((socket, next) => {
     const auth = socket.handshake.auth;
-    
-    console.log('========================================');
-    console.log('🔑 Full auth object:', JSON.stringify(auth));
-    console.log('🔑 auth.userId:', auth.userId);
-    console.log('========================================');
-    
-    const userId = auth.userId || 6;
-    
+    const userId = auth.userId || auth.user_id || 6;
     socket.data.userId = userId;
-    socket.data.userName = `User ${userId}`;
-    
-    console.log(`✅ Socket authenticated as user: ${userId}`);
+    socket.data.userName = auth.userName || `User ${userId}`;
+    socket.data.userRole = auth.userRole || 'customer';
+    console.log(`✅ Socket authenticated as user: ${userId} (${socket.data.userRole})`);
     next();
 });
 
 // Store room members
 const roomMembers = new Map();
 
+// ============================================
+// ✅ SOCKET.IO CONNECTION
+// ============================================
 io.on('connection', (socket) => {
     const userId = socket.data.userId;
     const userName = socket.data.userName;
+    const userRole = socket.data.userRole;
     
-    console.log(`🔵 User connected: ${userId} (${userName})`);
+    console.log(`🔵 User connected: ${userId} (${userName}) - Role: ${userRole}`);
     console.log(`📊 Active connections: ${io.engine.clientsCount}`);
-    
-    // JOIN CHAT ROOM - FIXED with verification
-    socket.on('join_chat', async ({ conversationId }) => {
-        const roomName = `chat_${conversationId}`;
-        
+
+    // ============================================
+    // ✅ JOIN USER ROOM (for direct messages)
+    // ============================================
+    socket.on('join_user_room', async (data) => {
         try {
-            console.log(`🔍 Checking conversation ${conversationId} in database...`);
+            const { userId: targetUserId } = data;
+            if (!targetUserId) {
+                socket.emit('error', { message: 'User ID required' });
+                return;
+            }
             
-            if (!pool) {
-                console.error('❌ Database not configured');
+            const roomName = `user_${targetUserId}`;
+            const rooms = Array.from(socket.rooms);
+            rooms.forEach(room => {
+                if (room.startsWith('user_')) {
+                    socket.leave(room);
+                }
+            });
+            
+            socket.join(roomName);
+            socket.data.userRoom = roomName;
+            console.log(`👤 User ${targetUserId} joined personal room: ${roomName}`);
+            
+        } catch (error) {
+            console.error('❌ Error joining user room:', error);
+            socket.emit('error', { message: 'Failed to join user room' });
+        }
+    });
+
+    // ============================================
+    // ✅ ORDER REQUEST - CUSTOMER TO SELLER (NO DATABASE)
+    // ============================================
+    socket.on('request_order', async (data) => {
+        try {
+            const { 
+                customerId, 
+                sellerId, 
+                serviceId, 
+                serviceName, 
+                quantity, 
+                totalPrice, 
+                notes, 
+                customerName,
+                customerImage,
+                deliveryDate
+            } = data;
+            
+            console.log(`📦 Order request from ${customerId} to seller ${sellerId}: ${serviceName}`);
+            
+            if (!customerId || !sellerId || !serviceId) {
                 socket.emit('error', { 
-                    message: 'Database not configured',
-                    details: 'Please check server configuration'
+                    message: 'Missing required fields',
+                    details: 'customerId, sellerId, and serviceId are required'
                 });
                 return;
             }
             
-            // ✅ Check if conversation exists
+            const orderId = `order_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+            const timestamp = new Date().toISOString();
+            const expiresAt = new Date(Date.now() + 30000); // 30 seconds
+            
+            const orderData = {
+                order_id: orderId,
+                customer_id: customerId,
+                seller_id: sellerId,
+                service_id: serviceId,
+                service_name: serviceName || 'Service',
+                quantity: quantity || 1,
+                total_price: totalPrice || 0,
+                notes: notes || '',
+                customer_name: customerName || 'Customer',
+                customer_image: customerImage || null,
+                delivery_date: deliveryDate || null,
+                status: 'pending',
+                created_at: timestamp,
+                expires_at: expiresAt.toISOString(),
+                timeout_seconds: 30
+            };
+            
+            // ✅ Store in memory ONLY (NO DATABASE)
+            pendingOrders.set(orderId, {
+                ...orderData,
+                expiresAt: expiresAt,
+                status: 'pending'
+            });
+            
+            // ✅ Broadcast to seller's room
+            const sellerRoom = `user_${sellerId}`;
+            io.to(sellerRoom).emit('order_request_received', {
+                ...orderData,
+                timeRemaining: 30
+            });
+            console.log(`📤 Order broadcasted to seller ${sellerId}`);
+            
+            // ✅ Confirm to customer
+            const customerRoom = `user_${customerId}`;
+            io.to(customerRoom).emit('order_request_sent', {
+                order_id: orderId,
+                seller_id: sellerId,
+                status: 'pending',
+                expires_at: expiresAt.toISOString(),
+                timeout_seconds: 30
+            });
+            
+            // ✅ Schedule timeout
+            const timeoutId = setTimeout(() => {
+                checkOrderExpiry(orderId);
+            }, 30000);
+            orderTimeouts.set(orderId, timeoutId);
+            
+            console.log(`📦 Order ${orderId} stored in memory, expires at ${expiresAt.toISOString()}`);
+            
+        } catch (error) {
+            console.error('❌ Error broadcasting order request:', error);
+            socket.emit('error', { 
+                message: 'Failed to send order request',
+                details: error.message 
+            });
+        }
+    });
+
+    // ============================================
+    // ✅ CHECK PENDING ORDER (from memory, NOT database)
+    // ============================================
+    socket.on('check_pending_order', async (data) => {
+        try {
+            const { orderId, userId } = data;
+            
+            console.log(`🔍 Checking pending order ${orderId} for user ${userId}`);
+            
+            const order = pendingOrders.get(orderId);
+            if (!order) {
+                socket.emit('pending_order_status', {
+                    order_id: orderId,
+                    status: 'not_found',
+                    message: 'Order not found'
+                });
+                return;
+            }
+            
+            const timeRemaining = order.expiresAt ? Math.max(0, Math.floor((order.expiresAt - new Date()) / 1000)) : 0;
+            
+            if (timeRemaining <= 0) {
+                // Order expired
+                pendingOrders.delete(orderId);
+                if (orderTimeouts.has(orderId)) {
+                    clearTimeout(orderTimeouts.get(orderId));
+                    orderTimeouts.delete(orderId);
+                }
+                socket.emit('pending_order_status', {
+                    order_id: orderId,
+                    status: 'expired',
+                    message: 'Order has expired'
+                });
+                return;
+            }
+            
+            socket.emit('pending_order_status', {
+                order_id: orderId,
+                status: 'pending',
+                order: {
+                    ...order,
+                    timeRemaining: timeRemaining,
+                    expires_at: order.expiresAt ? order.expiresAt.toISOString() : null
+                }
+            });
+            
+        } catch (error) {
+            console.error('❌ Error checking pending order:', error);
+            socket.emit('error', { message: 'Failed to check order' });
+        }
+    });
+
+    // ============================================
+    // ✅ ACCEPT ORDER REQUEST - Calls PHP
+    // ============================================
+    socket.on('accept_order_request', async (data) => {
+        try {
+            const { orderId, sellerId } = data;
+            
+            console.log(`✅ Seller ${sellerId} accepting order ${orderId}`);
+            
+            // ✅ Get order from memory
+            const order = pendingOrders.get(orderId);
+            if (!order) {
+                socket.emit('error', { message: 'Order not found or expired' });
+                return;
+            }
+            
+            if (order.seller_id !== sellerId) {
+                socket.emit('error', { message: 'Unauthorized' });
+                return;
+            }
+            
+            if (order.expiresAt < new Date()) {
+                pendingOrders.delete(orderId);
+                if (orderTimeouts.has(orderId)) {
+                    clearTimeout(orderTimeouts.get(orderId));
+                    orderTimeouts.delete(orderId);
+                }
+                socket.emit('error', { message: 'Order has expired' });
+                return;
+            }
+            
+            if (order.status !== 'pending') {
+                socket.emit('error', { message: `Order already ${order.status}` });
+                return;
+            }
+            
+            // ✅ Save to database via PHP
+            const phpUrl = 'https://helvora.app/api_app/update-order-status.php';
+            const response = await fetch(phpUrl, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    order_id: parseInt(orderId.split('_')[1] || orderId),
+                    status: 'accepted',
+                    seller_id: sellerId,
+                    customer_id: order.customer_id,
+                    service_name: order.service_name,
+                    total_price: order.total_price,
+                    delivery_date: order.delivery_date,
+                    notes: order.notes
+                })
+            });
+            
+            const result = await response.json();
+            console.log('📥 PHP accept response:', result);
+            
+            if (result.success) {
+                // ✅ Update order in memory
+                order.status = 'accepted';
+                order.work_order_id = result.work_order?.id || null;
+                order.accepted_at = new Date().toISOString();
+                pendingOrders.set(orderId, order);
+                
+                // ✅ Cancel timeout
+                if (orderTimeouts.has(orderId)) {
+                    clearTimeout(orderTimeouts.get(orderId));
+                    orderTimeouts.delete(orderId);
+                }
+                
+                // ✅ Broadcast to customer
+                const customerRoom = `user_${order.customer_id}`;
+                io.to(customerRoom).emit('order_request_accepted', {
+                    order_id: orderId,
+                    work_order_id: result.work_order?.id || null,
+                    seller_id: sellerId,
+                    status: 'accepted',
+                    accepted_at: new Date().toISOString()
+                });
+                
+                // ✅ Notify seller
+                const sellerRoom = `user_${sellerId}`;
+                io.to(sellerRoom).emit('order_accept_confirmed', {
+                    order_id: orderId,
+                    work_order_id: result.work_order?.id || null,
+                    status: 'accepted'
+                });
+                
+                socket.emit('order_accept_success', {
+                    order_id: orderId,
+                    work_order_id: result.work_order?.id || null,
+                    status: 'accepted',
+                    message: 'Order accepted successfully'
+                });
+                
+                // ✅ Clean up after 5 seconds
+                setTimeout(() => {
+                    if (pendingOrders.has(orderId)) {
+                        pendingOrders.delete(orderId);
+                        console.log(`🧹 Removed order ${orderId} from memory`);
+                    }
+                }, 5000);
+                
+            } else {
+                socket.emit('error', { 
+                    message: result.error || 'Failed to accept order' 
+                });
+            }
+            
+        } catch (error) {
+            console.error('❌ Error accepting order:', error);
+            socket.emit('error', { 
+                message: 'Failed to accept order: ' + error.message 
+            });
+        }
+    });
+
+    // ============================================
+    // ✅ DECLINE ORDER REQUEST - Calls PHP
+    // ============================================
+    socket.on('decline_order_request', async (data) => {
+        try {
+            const { orderId, sellerId, reason } = data;
+            
+            console.log(`❌ Seller ${sellerId} declining order ${orderId}`);
+            
+            const order = pendingOrders.get(orderId);
+            if (!order) {
+                socket.emit('error', { message: 'Order not found' });
+                return;
+            }
+            
+            if (order.seller_id !== sellerId) {
+                socket.emit('error', { message: 'Unauthorized' });
+                return;
+            }
+            
+            if (order.expiresAt < new Date()) {
+                pendingOrders.delete(orderId);
+                if (orderTimeouts.has(orderId)) {
+                    clearTimeout(orderTimeouts.get(orderId));
+                    orderTimeouts.delete(orderId);
+                }
+                socket.emit('error', { message: 'Order has expired' });
+                return;
+            }
+            
+            // ✅ Save to database via PHP
+            const phpUrl = 'https://helvora.app/api_app/update-order-status.php';
+            const response = await fetch(phpUrl, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    order_id: parseInt(orderId.split('_')[1] || orderId),
+                    status: 'rejected',
+                    seller_id: sellerId,
+                    reason: reason || 'Seller declined the request'
+                })
+            });
+            
+            const result = await response.json();
+            console.log('📥 PHP decline response:', result);
+            
+            if (result.success) {
+                // ✅ Remove from memory
+                pendingOrders.delete(orderId);
+                if (orderTimeouts.has(orderId)) {
+                    clearTimeout(orderTimeouts.get(orderId));
+                    orderTimeouts.delete(orderId);
+                }
+                
+                // ✅ Broadcast to customer
+                const customerRoom = `user_${order.customer_id}`;
+                io.to(customerRoom).emit('order_request_declined', {
+                    order_id: orderId,
+                    seller_id: sellerId,
+                    reason: reason || 'Seller declined the request',
+                    status: 'declined',
+                    declined_at: new Date().toISOString()
+                });
+                
+                // ✅ Notify seller
+                const sellerRoom = `user_${sellerId}`;
+                io.to(sellerRoom).emit('order_decline_confirmed', {
+                    order_id: orderId,
+                    status: 'declined'
+                });
+                
+                socket.emit('order_decline_success', {
+                    order_id: orderId,
+                    status: 'declined',
+                    message: 'Order declined successfully'
+                });
+                
+            } else {
+                socket.emit('error', { 
+                    message: result.error || 'Failed to decline order' 
+                });
+            }
+            
+        } catch (error) {
+            console.error('❌ Error declining order:', error);
+            socket.emit('error', { 
+                message: 'Failed to decline order: ' + error.message 
+            });
+        }
+    });
+
+    // ============================================
+    // ✅ ORDER EXPIRED - Emitted from timer
+    // ============================================
+    socket.on('order_expired', async (data) => {
+        try {
+            const { orderId } = data;
+            console.log(`⏰ Order ${orderId} expired (from client)`);
+            
+            const order = pendingOrders.get(orderId);
+            if (!order) return;
+            
+            // ✅ Remove from memory
+            pendingOrders.delete(orderId);
+            if (orderTimeouts.has(orderId)) {
+                clearTimeout(orderTimeouts.get(orderId));
+                orderTimeouts.delete(orderId);
+            }
+            
+            // ✅ Broadcast to both parties
+            const customerRoom = `user_${order.customer_id}`;
+            io.to(customerRoom).emit('order_request_expired', {
+                order_id: orderId,
+                status: 'expired',
+                expired_at: new Date().toISOString()
+            });
+            
+            const sellerRoom = `user_${order.seller_id}`;
+            io.to(sellerRoom).emit('order_request_expired', {
+                order_id: orderId,
+                status: 'expired',
+                expired_at: new Date().toISOString()
+            });
+            
+            console.log(`📤 Order ${orderId} expired broadcasted`);
+            
+        } catch (error) {
+            console.error('❌ Error handling order expiry:', error);
+        }
+    });
+
+    // ============================================
+    // ✅ CHAT EVENTS (existing)
+    // ============================================
+    socket.on('join_chat', async ({ conversationId }) => {
+        const roomName = `chat_${conversationId}`;
+        try {
+            if (!pool) {
+                socket.emit('error', { message: 'Database not configured' });
+                return;
+            }
+            
             const [convRows] = await pool.query(
                 'SELECT id, status, customer_id, seller_id FROM conversations WHERE id = ?',
                 [conversationId]
             );
             
-            console.log(`📊 Conversation query result: ${convRows.length} rows found`);
-            
             if (convRows.length === 0) {
-                console.log(`⚠️ Conversation ${conversationId} does not exist in database`);
-                
-                try {
-                    const [allConvs] = await pool.query(
-                        'SELECT id, status, customer_id, seller_id FROM conversations ORDER BY id DESC LIMIT 10'
-                    );
-                    console.log(`📊 Recent conversations:`, allConvs.map(c => ({ id: c.id, status: c.status })));
-                } catch (e) {
-                    console.log('⚠️ Could not fetch recent conversations:', e.message);
-                }
-                
-                socket.emit('error', { 
-                    message: 'Conversation not found',
-                    details: `Conversation ${conversationId} does not exist. Please refresh the chat.`
-                });
+                socket.emit('error', { message: 'Conversation not found' });
                 return;
             }
             
             const conv = convRows[0];
-            console.log(`✅ Found conversation:`, conv);
-            
-            // ✅ Check if user is part of this conversation
             if (userId != conv.customer_id && userId != conv.seller_id) {
-                console.log(`⚠️ User ${userId} is not part of conversation ${conversationId}`);
-                socket.emit('error', { 
-                    message: 'Unauthorized',
-                    details: 'You are not a participant in this conversation'
-                });
+                socket.emit('error', { message: 'Unauthorized' });
                 return;
             }
             
-            // ✅ If conversation is not active, reactivate it
-            if (conv.status !== 'active') {
-                await pool.query(
-                    'UPDATE conversations SET status = "active", updated_at = NOW() WHERE id = ?',
-                    [conversationId]
-                );
-                console.log(`✅ Reactivated conversation ${conversationId}`);
-            }
-            
-            // Leave any existing chat rooms
             const rooms = Array.from(socket.rooms);
             rooms.forEach(room => {
                 if (room.startsWith('chat_')) {
                     socket.leave(room);
-                    console.log(`📤 Left room: ${room}`);
                 }
             });
             
             socket.join(roomName);
             socket.data.currentRoom = roomName;
-            
             console.log(`📩 User ${userId} joined chat room: ${roomName}`);
             
             if (!roomMembers.has(roomName)) {
@@ -291,7 +605,6 @@ io.on('connection', (socket) => {
             }
             roomMembers.get(roomName).add(userId);
             
-            // ✅ Get chat history
             const messages = await getChatHistory(conversationId, 50);
             socket.emit('chat_history', {
                 conversationId,
@@ -300,10 +613,7 @@ io.on('connection', (socket) => {
                 timestamp: new Date().toISOString()
             });
             
-            // ✅ Mark messages as read
             await markMessagesAsRead(conversationId, userId);
-            
-            // ✅ Notify others
             socket.to(roomName).emit('user_joined', {
                 userId,
                 userName,
@@ -312,82 +622,22 @@ io.on('connection', (socket) => {
             
         } catch (error) {
             console.error('❌ Error joining chat:', error);
-            socket.emit('error', { 
-                message: 'Failed to join chat',
-                details: error.message 
-            });
+            socket.emit('error', { message: 'Failed to join chat' });
         }
     });
-    
-    // SEND MESSAGE - Simplified for now
+
     socket.on('send_message', async (data) => {
-        console.log('📨 send_message received:', JSON.stringify(data));
-        
         try {
-            const { conversationId, content, messageType = 'text', attachment_id } = data;
+            const { conversationId, content, messageType = 'text' } = data;
+            if (!conversationId || !pool) {
+                socket.emit('error', { message: 'Missing data or DB not configured' });
+                return;
+            }
             
-            if (!conversationId) {
-                console.error('❌ Missing conversationId');
-                socket.emit('error', { message: 'Missing conversationId' });
-                return;
-            }
-
-            if (!pool) {
-                console.error('❌ Database not configured');
-                socket.emit('error', { message: 'Database not configured' });
-                return;
-            }
-
             const senderId = socket.data.userId;
-            console.log(`📝 Sender: ${senderId}, Conversation: ${conversationId}`);
-
-            // ✅ VERIFY conversation exists
-            const [convRows] = await pool.query(
-                'SELECT id, status, customer_id, seller_id FROM conversations WHERE id = ?',
-                [conversationId]
-            );
-            
-            if (convRows.length === 0) {
-                console.error(`❌ Conversation ${conversationId} does not exist`);
-                socket.emit('error', { 
-                    message: 'Conversation not found',
-                    details: 'The conversation does not exist in the database'
-                });
-                return;
-            }
-            
-            const conv = convRows[0];
-            
-            // ✅ If conversation is not active, reactivate it
-            if (conv.status !== 'active') {
-                await pool.query(
-                    'UPDATE conversations SET status = "active", updated_at = NOW() WHERE id = ?',
-                    [conversationId]
-                );
-                console.log(`✅ Reactivated conversation ${conversationId}`);
-            }
-
-            // ✅ Check if sender is part of this conversation
-            if (senderId != conv.customer_id && senderId != conv.seller_id) {
-                console.error(`❌ Sender ${senderId} not part of conversation ${conversationId}`);
-                socket.emit('error', { 
-                    message: 'Unauthorized',
-                    details: 'You are not a participant in this conversation'
-                });
-                return;
-            }
-
-            // ✅ Save message
-            const message = await saveMessage({
-                conversationId,
-                senderId: senderId,
-                content: content || '',
-                messageType: messageType,
-            });
-            console.log(`💾 New message saved: ${message.id}`);
-
+            const message = await saveMessage({ conversationId, senderId, content, messageType });
             const senderInfo = await getUserInfo(senderId);
-
+            
             const messageData = {
                 id: message.id,
                 conversationId: conversationId,
@@ -400,298 +650,17 @@ io.on('connection', (socket) => {
                 is_read: 0,
                 attachments: [],
             };
-
+            
             const roomName = `chat_${conversationId}`;
             io.to(roomName).emit('new_message', messageData);
-            console.log(`📤 Broadcasted message from ${senderId} to room: ${roomName}`);
-
             await updateConversationTimestamp(conversationId);
-
+            
         } catch (error) {
             console.error('❌ Error sending message:', error);
-            socket.emit('error', { 
-                message: 'Failed to send message',
-                details: error.message 
-            });
-        }
-    });
-    
-    // ✅ NEW: Handle file uploaded
-    socket.on('new_file_uploaded', async (data) => {
-        try {
-            const { conversationId, messageId, attachmentId } = data;
-            
-            console.log(`📎 New file uploaded - conversation: ${conversationId}, message: ${messageId}, attachment: ${attachmentId}`);
-            
-            const [convRows] = await pool.query(
-                'SELECT id FROM conversations WHERE id = ?',
-                [conversationId]
-            );
-            
-            if (convRows.length === 0) {
-                console.log(`⚠️ Conversation ${conversationId} not found`);
-                socket.emit('error', { message: 'Conversation not found' });
-                return;
-            }
-            
-            const [messageRows] = await pool.query(
-                `SELECT 
-                    m.id,
-                    m.conversation_id as conversationId,
-                    m.sender_id as senderId,
-                    m.content,
-                    m.message_type as messageType,
-                    m.is_read as isRead,
-                    m.created_at as createdAt,
-                    u.name as senderName,
-                    u.profile_image as senderImage
-                FROM messages m
-                LEFT JOIN users u ON m.sender_id = u.id
-                WHERE m.id = ?`,
-                [messageId]
-            );
-            
-            if (messageRows.length === 0) {
-                console.log(`⚠️ Message ${messageId} not found`);
-                socket.emit('error', { message: 'Message not found' });
-                return;
-            }
-            
-            const message = messageRows[0];
-            
-            const [attachments] = await pool.query(
-                `SELECT 
-                    id,
-                    message_id,
-                    file_url,
-                    file_type,
-                    file_size,
-                    file_name,
-                    mime_type,
-                    width,
-                    height,
-                    is_image,
-                    created_at
-                FROM message_attachments 
-                WHERE message_id = ?`,
-                [messageId]
-            );
-            
-            const messageData = {
-                id: message.id,
-                conversationId: message.conversationId,
-                senderId: message.senderId,
-                senderName: message.senderName || 'User',
-                senderImage: message.senderImage || null,
-                content: message.content || '',
-                messageType: 'file',
-                isRead: message.isRead || 0,
-                createdAt: message.createdAt ? message.createdAt.toISOString() : new Date().toISOString(),
-                attachments: attachments.map(a => ({
-                    ...a,
-                    is_image: a.is_image === 1,
-                    created_at: a.created_at ? a.created_at.toISOString() : new Date().toISOString()
-                })),
-            };
-            
-            const roomName = `chat_${conversationId}`;
-            io.to(roomName).emit('new_message', messageData);
-            console.log(`📤 Broadcasted file message to room: ${roomName}`);
-            
-            await updateConversationTimestamp(conversationId);
-            
-        } catch (error) {
-            console.error('❌ Error handling new file upload:', error);
-            socket.emit('error', { 
-                message: 'Failed to process file upload',
-                details: error.message 
-            });
-        }
-    });
-    
-    // ✅ SEND OFFER
-    socket.on('send_offer', async (data) => {
-        try {
-            const { conversationId, offerData, messageId } = data;
-            
-            if (!conversationId || !offerData) {
-                socket.emit('error', { message: 'Missing required fields' });
-                return;
-            }
-            
-            const senderId = socket.data.userId;
-            
-            console.log(`📝 Offer broadcast from ${senderId} in chat ${conversationId}:`, offerData);
-            
-            const [convRows] = await pool.query(
-                'SELECT id FROM conversations WHERE id = ?',
-                [conversationId]
-            );
-            
-            if (convRows.length === 0) {
-                console.log(`⚠️ Conversation ${conversationId} not found`);
-                socket.emit('error', { message: 'Conversation not found' });
-                return;
-            }
-            
-            const senderInfo = await getUserInfo(senderId);
-            
-            const messageData = {
-                id: messageId || `temp_${Date.now()}`,
-                conversationId: conversationId,
-                senderId: senderId,
-                senderName: senderInfo?.name || `User ${senderId}`,
-                senderImage: senderInfo?.profile_image || null,
-                content: JSON.stringify(offerData),
-                messageType: 'offer',
-                createdAt: new Date().toISOString(),
-                is_read: 0,
-                attachments: [],
-            };
-            
-            const roomName = `chat_${conversationId}`;
-            io.to(roomName).emit('new_message', messageData);
-            console.log(`📤 Broadcasted offer ${offerData.offer_id} from ${senderId} to room: ${roomName}`);
-            
-            await updateConversationTimestamp(conversationId);
-            
-        } catch (error) {
-            console.error('❌ Error sending offer:', error);
-            socket.emit('error', { 
-                message: 'Failed to send offer',
-                details: error.message 
-            });
+            socket.emit('error', { message: 'Failed to send message' });
         }
     });
 
-    // ✅ Handle offer updated (accepted/declined)
-    socket.on('offer_updated', async (data) => {
-        try {
-            const { conversationId, offerId, status, orderId } = data;
-            
-            console.log(`📋 Offer ${offerId} updated to ${status} in conversation ${conversationId}`);
-            
-            const [offerRows] = await pool.query(
-                'SELECT * FROM custom_offers WHERE id = ?',
-                [offerId]
-            );
-            
-            if (offerRows.length === 0) {
-                console.log(`⚠️ Offer ${offerId} not found`);
-                return;
-            }
-            
-            const offer = offerRows[0];
-            
-            let message = null;
-            
-            const [messageRows] = await pool.query(
-                `SELECT * FROM messages 
-                 WHERE conversation_id = ? 
-                 AND message_type = 'offer'
-                 AND content LIKE ?`,
-                [conversationId, `%"offer_id":${offerId}%`]
-            );
-            
-            if (messageRows.length > 0) {
-                message = messageRows[0];
-                console.log(`✅ Found message via LIKE query: ${message.id}`);
-            } else {
-                console.log(`⚠️ No message found with LIKE query, trying JSON parsing...`);
-                const [allOfferMessages] = await pool.query(
-                    `SELECT * FROM messages 
-                     WHERE conversation_id = ? 
-                     AND message_type = 'offer'`,
-                    [conversationId]
-                );
-                
-                for (const msg of allOfferMessages) {
-                    try {
-                        const parsed = JSON.parse(msg.content);
-                        if (parsed.offer_id === offerId || parsed.id === offerId) {
-                            message = msg;
-                            console.log(`✅ Found message via JSON parsing: ${message.id}`);
-                            break;
-                        }
-                    } catch (e) {
-                        continue;
-                    }
-                }
-            }
-            
-            if (!message) {
-                console.log(`⚠️ No message found for offer ${offerId}, but offer was updated in DB`);
-                return;
-            }
-            
-            let offerData = JSON.parse(message.content);
-            offerData.status = status;
-            if (orderId) {
-                offerData.order_id = orderId;
-            }
-            
-            await pool.query(
-                'UPDATE messages SET content = ? WHERE id = ?',
-                [JSON.stringify(offerData), message.id]
-            );
-            
-            const senderInfo = await getUserInfo(message.sender_id);
-            
-            const roomName = `chat_${conversationId}`;
-            const messageData = {
-                id: message.id,
-                conversationId: conversationId,
-                senderId: message.sender_id,
-                senderName: senderInfo?.name || 'User',
-                senderImage: senderInfo?.profile_image || null,
-                content: JSON.stringify(offerData),
-                messageType: 'offer',
-                createdAt: message.created_at ? message.created_at.toISOString() : new Date().toISOString(),
-                is_read: 1,
-                attachments: [],
-            };
-            
-            io.to(roomName).emit('offer_updated', messageData);
-            console.log(`📤 Broadcasted offer update to room: ${roomName}`);
-            
-            let statusMessage = '';
-            if (status === 'accepted') {
-                statusMessage = `✅ Offer accepted! Work order #${orderId || 'created'} has been created.`;
-            } else if (status === 'declined') {
-                statusMessage = `❌ Offer declined.`;
-            }
-            
-            if (statusMessage) {
-                const systemMessage = await saveMessage({
-                    conversationId,
-                    senderId: message.sender_id,
-                    content: statusMessage,
-                    messageType: 'text',
-                });
-                
-                const systemMessageData = {
-                    id: systemMessage.id,
-                    conversationId: conversationId,
-                    senderId: systemMessage.senderId,
-                    senderName: 'System',
-                    senderImage: null,
-                    content: statusMessage,
-                    messageType: 'text',
-                    createdAt: systemMessage.createdAt,
-                    is_read: 0,
-                    attachments: [],
-                };
-                
-                io.to(roomName).emit('new_message', systemMessageData);
-                console.log(`📤 Broadcasted system message to room: ${roomName}`);
-            }
-            
-        } catch (error) {
-            console.error('❌ Error handling offer update:', error);
-        }
-    });
-    
-    // TYPING INDICATOR
     socket.on('typing', ({ conversationId, isTyping }) => {
         const roomName = `chat_${conversationId}`;
         socket.to(roomName).emit('user_typing', {
@@ -701,8 +670,7 @@ io.on('connection', (socket) => {
             timestamp: new Date().toISOString()
         });
     });
-    
-    // MARK MESSAGES AS READ
+
     socket.on('mark_read', async ({ conversationId }) => {
         try {
             if (!pool) return;
@@ -717,492 +685,17 @@ io.on('connection', (socket) => {
             console.error('Error marking as read:', error);
         }
     });
-    
-    // ✅ ============================================
-    // ✅ ORDER MANAGEMENT FEATURES
-    // ✅ ============================================
-    
-    // ✅ PRICE CHANGE - Request
-    socket.on('request_price_change', async (data) => {
-        try {
-            const { orderId, newPrice, reason } = data;
-            const sellerId = socket.data.userId;
-            
-            console.log(`💰 Price change requested for order ${orderId}: ${newPrice}`);
-            
-            const [orderRows] = await pool.query(
-                'SELECT customer_id, seller_id FROM work_orders WHERE id = ?',
-                [orderId]
-            );
-            
-            if (orderRows.length === 0) {
-                socket.emit('error', { message: 'Order not found' });
-                return;
-            }
-            
-            const order = orderRows[0];
-            if (order.seller_id !== sellerId) {
-                socket.emit('error', { message: 'Unauthorized' });
-                return;
-            }
-            
-            await pool.query(
-                `UPDATE work_orders 
-                SET pending_price = ?, 
-                    price_change_reason = ?, 
-                    price_change_status = 'pending',
-                    updated_at = NOW() 
-                WHERE id = ?`,
-                [newPrice, reason, orderId]
-            );
-            
-            const roomName = `chat_${orderId}`;
-            io.to(roomName).emit('price_change_requested', {
-                orderId,
-                newPrice,
-                reason,
-                sellerId,
-                timestamp: new Date().toISOString()
-            });
-            
-            console.log(`📤 Price change request broadcasted to room: ${roomName}`);
-            
-        } catch (error) {
-            console.error('❌ Error requesting price change:', error);
-            socket.emit('error', { message: 'Failed to request price change' });
-        }
-    });
-    
-    // ✅ PRICE CHANGE - Accept - FIXED (removed total_amount update)
-    socket.on('accept_price_change', async (data) => {
-        try {
-            const { orderId } = data;
-            const customerId = socket.data.userId;
-            
-            console.log(`✅ Price change accepted for order ${orderId}`);
-            
-            const [orderRows] = await pool.query(
-                'SELECT customer_id, seller_id, pending_price FROM work_orders WHERE id = ?',
-                [orderId]
-            );
-            
-            if (orderRows.length === 0) {
-                socket.emit('error', { message: 'Order not found' });
-                return;
-            }
-            
-            const order = orderRows[0];
-            if (order.customer_id !== customerId) {
-                socket.emit('error', { message: 'Unauthorized' });
-                return;
-            }
-            
-            // ✅ FIX: ONLY update status, NOT total_amount
-            // The total_amount is already updated by update-order-price.php
-            await pool.query(
-                `UPDATE work_orders 
-                SET pending_price = NULL, 
-                    price_change_status = 'accepted',
-                    cancellation_requested_by = NULL,
-                    updated_at = NOW() 
-                WHERE id = ?`,
-                [orderId]
-            );
-            
-            const roomName = `chat_${orderId}`;
-            io.to(roomName).emit('price_change_accepted', {
-                orderId,
-                newPrice: order.pending_price,
-                timestamp: new Date().toISOString()
-            });
-            
-            console.log(`📤 Price change acceptance broadcasted to room: ${roomName}`);
-            
-        } catch (error) {
-            console.error('❌ Error accepting price change:', error);
-            socket.emit('error', { message: 'Failed to accept price change' });
-        }
-    });
-    
-    // ✅ PRICE CHANGE - Reject
-    socket.on('reject_price_change', async (data) => {
-        try {
-            const { orderId } = data;
-            const customerId = socket.data.userId;
-            
-            console.log(`❌ Price change rejected for order ${orderId}`);
-            
-            const [orderRows] = await pool.query(
-                'SELECT customer_id FROM work_orders WHERE id = ?',
-                [orderId]
-            );
-            
-            if (orderRows.length === 0) {
-                socket.emit('error', { message: 'Order not found' });
-                return;
-            }
-            
-            const order = orderRows[0];
-            if (order.customer_id !== customerId) {
-                socket.emit('error', { message: 'Unauthorized' });
-                return;
-            }
-            
-            await pool.query(
-                `UPDATE work_orders 
-                SET pending_price = NULL, 
-                    price_change_status = 'rejected',
-                    cancellation_requested_by = NULL,
-                    updated_at = NOW() 
-                WHERE id = ?`,
-                [orderId]
-            );
-            
-            const roomName = `chat_${orderId}`;
-            io.to(roomName).emit('price_change_rejected', {
-                orderId,
-                timestamp: new Date().toISOString()
-            });
-            
-            console.log(`📤 Price change rejection broadcasted to room: ${roomName}`);
-            
-        } catch (error) {
-            console.error('❌ Error rejecting price change:', error);
-            socket.emit('error', { message: 'Failed to reject price change' });
-        }
-    });
-    
-    // ✅ DEADLINE EXTENSION - Request
-    socket.on('request_deadline_extension', async (data) => {
-        try {
-            const { orderId, newDeadline, reason } = data;
-            const sellerId = socket.data.userId;
-            
-            console.log(`📅 Deadline extension requested for order ${orderId}: ${newDeadline}`);
-            
-            const [orderRows] = await pool.query(
-                'SELECT customer_id, seller_id FROM work_orders WHERE id = ?',
-                [orderId]
-            );
-            
-            if (orderRows.length === 0) {
-                socket.emit('error', { message: 'Order not found' });
-                return;
-            }
-            
-            const order = orderRows[0];
-            if (order.seller_id !== sellerId) {
-                socket.emit('error', { message: 'Unauthorized' });
-                return;
-            }
-            
-            await pool.query(
-                `UPDATE work_orders 
-                SET pending_deadline = ?, 
-                    deadline_extension_reason = ?, 
-                    deadline_extension_status = 'pending',
-                    cancellation_requested_by = ?,
-                    updated_at = NOW() 
-                WHERE id = ?`,
-                [newDeadline, reason, 'seller', orderId]
-            );
-            
-            const roomName = `chat_${orderId}`;
-            io.to(roomName).emit('deadline_extension_requested', {
-                orderId,
-                newDeadline,
-                reason,
-                sellerId,
-                timestamp: new Date().toISOString()
-            });
-            
-            console.log(`📤 Deadline extension request broadcasted to room: ${roomName}`);
-            
-        } catch (error) {
-            console.error('❌ Error requesting deadline extension:', error);
-            socket.emit('error', { message: 'Failed to request deadline extension' });
-        }
-    });
-    
-    // ✅ DEADLINE EXTENSION - Accept - FIXED (removed delivery_date update)
-    socket.on('accept_deadline_extension', async (data) => {
-        try {
-            const { orderId } = data;
-            const customerId = socket.data.userId;
-            
-            console.log(`✅ Deadline extension accepted for order ${orderId}`);
-            
-            const [orderRows] = await pool.query(
-                'SELECT customer_id, seller_id, pending_deadline FROM work_orders WHERE id = ?',
-                [orderId]
-            );
-            
-            if (orderRows.length === 0) {
-                socket.emit('error', { message: 'Order not found' });
-                return;
-            }
-            
-            const order = orderRows[0];
-            if (order.customer_id !== customerId) {
-                socket.emit('error', { message: 'Unauthorized' });
-                return;
-            }
-            
-            // ✅ FIX: ONLY update status, NOT delivery_date
-            // The delivery_date and pending_deadline are already updated by update-order-deadline.php
-            await pool.query(
-                `UPDATE work_orders 
-                SET pending_deadline = NULL, 
-                    deadline_extension_status = 'accepted',
-                    cancellation_requested_by = NULL,
-                    updated_at = NOW() 
-                WHERE id = ?`,
-                [orderId]
-            );
-            
-            const roomName = `chat_${orderId}`;
-            io.to(roomName).emit('deadline_extension_accepted', {
-                orderId,
-                newDeadline: order.pending_deadline,
-                timestamp: new Date().toISOString()
-            });
-            
-            console.log(`📤 Deadline extension acceptance broadcasted to room: ${roomName}`);
-            
-        } catch (error) {
-            console.error('❌ Error accepting deadline extension:', error);
-            socket.emit('error', { message: 'Failed to accept deadline extension' });
-        }
-    });
-    
-    // ✅ DEADLINE EXTENSION - Reject - FIXED
-    socket.on('reject_deadline_extension', async (data) => {
-        try {
-            const { orderId } = data;
-            const customerId = socket.data.userId;
-            
-            console.log(`❌ Deadline extension rejected for order ${orderId}`);
-            
-            const [orderRows] = await pool.query(
-                'SELECT customer_id FROM work_orders WHERE id = ?',
-                [orderId]
-            );
-            
-            if (orderRows.length === 0) {
-                socket.emit('error', { message: 'Order not found' });
-                return;
-            }
-            
-            const order = orderRows[0];
-            if (order.customer_id !== customerId) {
-                socket.emit('error', { message: 'Unauthorized' });
-                return;
-            }
-            
-            // ✅ FIX: ONLY update status
-            await pool.query(
-                `UPDATE work_orders 
-                SET pending_deadline = NULL, 
-                    deadline_extension_status = 'rejected',
-                    cancellation_requested_by = NULL,
-                    updated_at = NOW() 
-                WHERE id = ?`,
-                [orderId]
-            );
-            
-            const roomName = `chat_${orderId}`;
-            io.to(roomName).emit('deadline_extension_rejected', {
-                orderId,
-                timestamp: new Date().toISOString()
-            });
-            
-            console.log(`📤 Deadline extension rejection broadcasted to room: ${roomName}`);
-            
-        } catch (error) {
-            console.error('❌ Error rejecting deadline extension:', error);
-            socket.emit('error', { message: 'Failed to reject deadline extension' });
-        }
-    });
-    
-    // ✅ CANCELLATION - Request
-    socket.on('request_cancellation', async (data) => {
-        try {
-            const { orderId, reason, requestedBy } = data;
-            const userId = socket.data.userId;
-            
-            console.log(`🔴 Cancellation requested for order ${orderId} by ${requestedBy}`);
-            
-            const [orderRows] = await pool.query(
-                'SELECT customer_id, seller_id FROM work_orders WHERE id = ?',
-                [orderId]
-            );
-            
-            if (orderRows.length === 0) {
-                socket.emit('error', { message: 'Order not found' });
-                return;
-            }
-            
-            const order = orderRows[0];
-            if (order.customer_id !== userId && order.seller_id !== userId) {
-                socket.emit('error', { message: 'Unauthorized' });
-                return;
-            }
-            
-            await pool.query(
-                `UPDATE work_orders 
-                SET cancellation_requested_by = ?, 
-                    cancellation_reason = ?, 
-                    cancellation_status = 'pending',
-                    updated_at = NOW() 
-                WHERE id = ?`,
-                [requestedBy, reason, orderId]
-            );
-            
-            const roomName = `chat_${orderId}`;
-            io.to(roomName).emit('cancellation_requested', {
-                orderId,
-                reason,
-                requestedBy,
-                timestamp: new Date().toISOString()
-            });
-            
-            console.log(`📤 Cancellation request broadcasted to room: ${roomName}`);
-            
-        } catch (error) {
-            console.error('❌ Error requesting cancellation:', error);
-            socket.emit('error', { message: 'Failed to request cancellation' });
-        }
-    });
-    
-    // ✅ CANCELLATION - Accept - FIXED (removed status='cancelled' update)
-    socket.on('accept_cancellation', async (data) => {
-        try {
-            const { orderId } = data;
-            const userId = socket.data.userId;
-            
-            console.log(`✅ Cancellation accepted for order ${orderId}`);
-            
-            const [orderRows] = await pool.query(
-                'SELECT customer_id, seller_id FROM work_orders WHERE id = ?',
-                [orderId]
-            );
-            
-            if (orderRows.length === 0) {
-                socket.emit('error', { message: 'Order not found' });
-                return;
-            }
-            
-            const order = orderRows[0];
-            if (order.customer_id !== userId && order.seller_id !== userId) {
-                socket.emit('error', { message: 'Unauthorized' });
-                return;
-            }
-            
-            // ✅ FIX: ONLY update cancellation_status
-            // The status='cancelled' is already updated by update-order-cancellation.php
-            await pool.query(
-                `UPDATE work_orders 
-                SET cancellation_status = 'accepted',
-                    cancellation_requested_by = NULL,
-                    updated_at = NOW() 
-                WHERE id = ?`,
-                [orderId]
-            );
-            
-            const roomName = `chat_${orderId}`;
-            io.to(roomName).emit('cancellation_accepted', {
-                orderId,
-                timestamp: new Date().toISOString()
-            });
-            
-            console.log(`📤 Cancellation acceptance broadcasted to room: ${roomName}`);
-            
-        } catch (error) {
-            console.error('❌ Error accepting cancellation:', error);
-            socket.emit('error', { message: 'Failed to accept cancellation' });
-        }
-    });
-    
-    // ✅ CANCELLATION - Reject
-    socket.on('reject_cancellation', async (data) => {
-        try {
-            const { orderId } = data;
-            const userId = socket.data.userId;
-            
-            console.log(`❌ Cancellation rejected for order ${orderId}`);
-            
-            const [orderRows] = await pool.query(
-                'SELECT customer_id, seller_id FROM work_orders WHERE id = ?',
-                [orderId]
-            );
-            
-            if (orderRows.length === 0) {
-                socket.emit('error', { message: 'Order not found' });
-                return;
-            }
-            
-            const order = orderRows[0];
-            if (order.customer_id !== userId && order.seller_id !== userId) {
-                socket.emit('error', { message: 'Unauthorized' });
-                return;
-            }
-            
-            await pool.query(
-                `UPDATE work_orders 
-                SET cancellation_status = 'rejected',
-                    cancellation_requested_by = NULL,
-                    updated_at = NOW() 
-                WHERE id = ?`,
-                [orderId]
-            );
-            
-            const roomName = `chat_${orderId}`;
-            io.to(roomName).emit('cancellation_rejected', {
-                orderId,
-                timestamp: new Date().toISOString()
-            });
-            
-            console.log(`📤 Cancellation rejection broadcasted to room: ${roomName}`);
-            
-        } catch (error) {
-            console.error('❌ Error rejecting cancellation:', error);
-            socket.emit('error', { message: 'Failed to reject cancellation' });
-        }
-    });
-    
-    // ✅ CONTACT SUPPORT
-    socket.on('contact_support', async (data) => {
-        try {
-            const { orderId, message, userId } = data;
-            
-            console.log(`🆘 Support requested for order ${orderId}`);
-            
-            // Save support request
-            await pool.query(
-                `INSERT INTO support_requests (order_id, user_id, message, status, created_at) 
-                VALUES (?, ?, ?, 'pending', NOW())`,
-                [orderId, userId, message]
-            );
-            
-            const roomName = `chat_${orderId}`;
-            io.to(roomName).emit('support_contacted', {
-                orderId,
-                message,
-                timestamp: new Date().toISOString()
-            });
-            
-            console.log(`📤 Support request broadcasted to room: ${roomName}`);
-            
-        } catch (error) {
-            console.error('❌ Error contacting support:', error);
-            socket.emit('error', { message: 'Failed to contact support' });
-        }
-    });
-    
-    // DISCONNECT
+
+    // ============================================
+    // ✅ DISCONNECT
+    // ============================================
     socket.on('disconnect', () => {
         console.log(`🔴 User disconnected: ${userId}`);
         console.log(`📊 Active connections: ${io.engine.clientsCount}`);
+        
+        if (socket.data.userRoom) {
+            socket.leave(socket.data.userRoom);
+        }
         
         roomMembers.forEach((members, roomName) => {
             if (members.has(userId)) {
@@ -1215,30 +708,67 @@ io.on('connection', (socket) => {
     });
 });
 
-// ✅ DATABASE FUNCTIONS with error handling
+// ============================================
+// ✅ ORDER EXPIRY CHECKER
+// ============================================
+function checkOrderExpiry(orderId) {
+    const order = pendingOrders.get(orderId);
+    if (!order) return;
+    
+    if (order.status === 'pending' && order.expiresAt < new Date()) {
+        order.status = 'expired';
+        pendingOrders.delete(orderId);
+        
+        if (orderTimeouts.has(orderId)) {
+            clearTimeout(orderTimeouts.get(orderId));
+            orderTimeouts.delete(orderId);
+        }
+        
+        // ✅ Notify customer
+        const customerRoom = `user_${order.customer_id}`;
+        io.to(customerRoom).emit('order_request_expired', {
+            order_id: orderId,
+            status: 'expired',
+            expired_at: new Date().toISOString()
+        });
+        
+        // ✅ Notify seller
+        const sellerRoom = `user_${order.seller_id}`;
+        io.to(sellerRoom).emit('order_request_expired', {
+            order_id: orderId,
+            status: 'expired',
+            expired_at: new Date().toISOString()
+        });
+        
+        console.log(`⏰ Order ${orderId} expired`);
+    }
+}
+
+// ✅ Clean up expired orders every 5 seconds
+setInterval(() => {
+    const now = new Date();
+    for (const [orderId, order] of pendingOrders) {
+        if (order.expiresAt < now && order.status === 'pending') {
+            checkOrderExpiry(orderId);
+        }
+    }
+}, 5000);
+
+// ============================================
+// ✅ DATABASE FUNCTIONS (for chat only)
+// ============================================
 async function getChatHistory(conversationId, limit = 50, offset = 0) {
     if (!pool) return [];
-    
     try {
         const [rows] = await pool.query(
-            `SELECT 
-                m.id,
-                m.conversation_id as conversationId,
-                m.sender_id as senderId,
-                m.content,
-                m.message_type as messageType,
-                m.is_read as isRead,
-                m.created_at as createdAt,
-                u.name as senderName,
-                u.profile_image as senderImage
-            FROM messages m
-            LEFT JOIN users u ON m.sender_id = u.id
-            WHERE m.conversation_id = ? AND m.is_deleted = 0
-            ORDER BY m.created_at DESC
-            LIMIT ? OFFSET ?`,
+            `SELECT m.id, m.conversation_id as conversationId, m.sender_id as senderId,
+             m.content, m.message_type as messageType, m.is_read as isRead,
+             m.created_at as createdAt, u.name as senderName, u.profile_image as senderImage
+             FROM messages m LEFT JOIN users u ON m.sender_id = u.id
+             WHERE m.conversation_id = ? AND m.is_deleted = 0
+             ORDER BY m.created_at DESC LIMIT ? OFFSET ?`,
             [conversationId, limit, offset]
         );
-        
         return rows.reverse().map(row => ({
             ...row,
             createdAt: row.createdAt ? row.createdAt.toISOString() : null,
@@ -1252,30 +782,17 @@ async function getChatHistory(conversationId, limit = 50, offset = 0) {
 
 async function saveMessage({ conversationId, senderId, content, messageType }) {
     if (!pool) throw new Error('Database not configured');
-    
-    console.log(`💾 Saving message - conversationId: ${conversationId}, senderId: ${senderId}, type: ${messageType}`);
-    
     const [result] = await pool.query(
-        `INSERT INTO messages 
-        (conversation_id, sender_id, content, message_type, contains_contact_info)
-        VALUES (?, ?, ?, ?, 0)`,
+        `INSERT INTO messages (conversation_id, sender_id, content, message_type, contains_contact_info)
+         VALUES (?, ?, ?, ?, 0)`,
         [conversationId, senderId, content || '', messageType || 'text']
     );
-    
     const [rows] = await pool.query(
-        `SELECT 
-            id,
-            conversation_id as conversationId,
-            sender_id as senderId,
-            content,
-            message_type as messageType,
-            is_read as isRead,
-            created_at as createdAt
-        FROM messages 
-        WHERE id = ?`,
+        `SELECT id, conversation_id as conversationId, sender_id as senderId,
+         content, message_type as messageType, is_read as isRead, created_at as createdAt
+         FROM messages WHERE id = ?`,
         [result.insertId]
     );
-    
     return {
         ...rows[0],
         createdAt: rows[0].createdAt ? rows[0].createdAt.toISOString() : new Date().toISOString()
@@ -1285,10 +802,7 @@ async function saveMessage({ conversationId, senderId, content, messageType }) {
 async function getUserInfo(userId) {
     if (!pool) return null;
     try {
-        const [rows] = await pool.query(
-            'SELECT id, name, profile_image FROM users WHERE id = ?',
-            [userId]
-        );
+        const [rows] = await pool.query('SELECT id, name, profile_image FROM users WHERE id = ?', [userId]);
         return rows[0] || null;
     } catch (error) {
         console.error('Error getting user info:', error);
@@ -1300,11 +814,8 @@ async function markMessagesAsRead(conversationId, userId) {
     if (!pool) return;
     try {
         await pool.query(
-            `UPDATE messages 
-            SET is_read = 1, read_at = NOW()
-            WHERE conversation_id = ? 
-            AND sender_id != ?
-            AND is_read = 0`,
+            `UPDATE messages SET is_read = 1, read_at = NOW()
+             WHERE conversation_id = ? AND sender_id != ? AND is_read = 0`,
             [conversationId, userId]
         );
     } catch (error) {
@@ -1316,9 +827,7 @@ async function updateConversationTimestamp(conversationId) {
     if (!pool) return;
     try {
         await pool.query(
-            `UPDATE conversations 
-            SET last_message_at = NOW()
-            WHERE id = ?`,
+            `UPDATE conversations SET last_message_at = NOW() WHERE id = ?`,
             [conversationId]
         );
     } catch (error) {
@@ -1326,12 +835,13 @@ async function updateConversationTimestamp(conversationId) {
     }
 }
 
-// START SERVER
+// ============================================
+// ✅ START SERVER
+// ============================================
 const PORT = process.env.PORT || 3000;
 
 async function startServer() {
     console.log('📊 Testing database connection...');
-    
     try {
         if (testConnection) {
             const connected = await testConnection();
@@ -1340,8 +850,6 @@ async function startServer() {
             } else {
                 console.log('⚠️ Database connection failed, but server will continue.');
             }
-        } else {
-            console.log('⚠️ Database test function not available.');
         }
     } catch (error) {
         console.error('❌ Database test error:', error.message);
@@ -1350,22 +858,13 @@ async function startServer() {
     server.listen(PORT, '0.0.0.0', () => {
         console.log(`🚀 WebSocket server running on port ${PORT}`);
         console.log(`📡 Socket.io ready for connections`);
-        console.log(`🔗 Health check: /health`);
-        console.log(`🔍 Debug endpoints:`);
-        console.log(`   - /debug/conversations`);
-        console.log(`   - /debug/conversation/:id`);
-        console.log(`   - /debug/messages/:conversationId`);
-        console.log(`📋 Order Management Events:`);
-        console.log(`   - request_price_change`);
-        console.log(`   - accept_price_change`);
-        console.log(`   - reject_price_change`);
-        console.log(`   - request_deadline_extension`);
-        console.log(`   - accept_deadline_extension`);
-        console.log(`   - reject_deadline_extension`);
-        console.log(`   - request_cancellation`);
-        console.log(`   - accept_cancellation`);
-        console.log(`   - reject_cancellation`);
-        console.log(`   - contact_support`);
+        console.log(`📋 Order Broadcasting (NO DATABASE):`);
+        console.log(`   📤 request_order - Customer requests a service`);
+        console.log(`   ✅ accept_order_request - Seller accepts (calls PHP)`);
+        console.log(`   ❌ decline_order_request - Seller declines (calls PHP)`);
+        console.log(`   🔍 check_pending_order - Check order status (from memory)`);
+        console.log(`   ⏰ Auto-expiry after 30 seconds`);
+        console.log(`📊 Pending orders in memory: 0`);
     });
 }
 
@@ -1383,10 +882,6 @@ process.on('SIGTERM', () => {
         console.log('✅ Shutdown complete');
         process.exit(0);
     });
-});
-
-process.on('uncaughtException', (error) => {
-    console.error('💥 Uncaught Exception:', error);
 });
 
 module.exports = { io, server, app };
