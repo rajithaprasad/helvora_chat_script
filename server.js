@@ -59,7 +59,8 @@ app.get('/', (req, res) => {
         endpoints: {
             health: '/health',
             websocket: 'wss://' + req.get('host'),
-            pending_orders: '/debug/pending-orders'
+            pending_orders: '/debug/pending-orders',
+            rooms: '/debug/rooms'
         }
     });
 });
@@ -111,6 +112,20 @@ app.get('/debug/pending-order/:id', (req, res) => {
     }
 });
 
+// ✅ DEBUG: Get all rooms and members
+app.get('/debug/rooms', (req, res) => {
+    const rooms = {};
+    for (const [roomName, members] of roomMembers) {
+        rooms[roomName] = Array.from(members);
+    }
+    res.json({
+        success: true,
+        rooms: rooms,
+        totalRooms: roomMembers.size,
+        totalConnections: io.engine.clientsCount
+    });
+});
+
 // ============================================
 // ✅ SOCKET.IO AUTHENTICATION
 // ============================================
@@ -138,6 +153,19 @@ io.on('connection', (socket) => {
     console.log(`🔵 User connected: ${userId} (${userName}) - Role: ${userRole}`);
     console.log(`📊 Active connections: ${io.engine.clientsCount}`);
 
+    // ✅ Auto-join user room on connection
+    const roomName = `user_${userId}`;
+    socket.join(roomName);
+    socket.data.userRoom = roomName;
+    
+    if (!roomMembers.has(roomName)) {
+        roomMembers.set(roomName, new Set());
+    }
+    roomMembers.get(roomName).add(userId);
+    
+    console.log(`👤 User ${userId} auto-joined personal room: ${roomName}`);
+    console.log(`📊 Room ${roomName} has ${roomMembers.get(roomName).size} members`);
+
     // ============================================
     // ✅ JOIN USER ROOM (for direct messages)
     // ============================================
@@ -152,14 +180,21 @@ io.on('connection', (socket) => {
             const roomName = `user_${targetUserId}`;
             const rooms = Array.from(socket.rooms);
             rooms.forEach(room => {
-                if (room.startsWith('user_')) {
+                if (room.startsWith('user_') && room !== roomName) {
                     socket.leave(room);
                 }
             });
             
             socket.join(roomName);
             socket.data.userRoom = roomName;
+            
+            if (!roomMembers.has(roomName)) {
+                roomMembers.set(roomName, new Set());
+            }
+            roomMembers.get(roomName).add(targetUserId);
+            
             console.log(`👤 User ${targetUserId} joined personal room: ${roomName}`);
+            console.log(`📊 Room ${roomName} has ${roomMembers.get(roomName).size} members`);
             
         } catch (error) {
             console.error('❌ Error joining user room:', error);
@@ -224,13 +259,35 @@ io.on('connection', (socket) => {
                 status: 'pending'
             });
             
-            // ✅ Broadcast to seller's room
-            const sellerRoom = `user_${sellerId}`;
-            io.to(sellerRoom).emit('order_request_received', {
-                ...orderData,
-                timeRemaining: 30
-            });
-            console.log(`📤 Order broadcasted to seller ${sellerId}`);
+            // ✅ Try to find seller's socket directly
+            const sellerSockets = await io.fetchSockets();
+            let sellerFound = false;
+            let sellerSocketId = null;
+            
+            for (const sock of sellerSockets) {
+                if (sock.data.userId === sellerId) {
+                    sellerFound = true;
+                    sellerSocketId = sock.id;
+                    sock.emit('order_request_received', {
+                        ...orderData,
+                        timeRemaining: 30
+                    });
+                    console.log(`📤 Directly sent to seller ${sellerId} (socket: ${sellerSocketId})`);
+                }
+            }
+            
+            if (!sellerFound) {
+                // Fallback: broadcast to room
+                const sellerRoom = `user_${sellerId}`;
+                const roomSockets = await io.in(sellerRoom).fetchSockets();
+                console.log(`📊 Room ${sellerRoom} has ${roomSockets.length} connected clients`);
+                
+                io.to(sellerRoom).emit('order_request_received', {
+                    ...orderData,
+                    timeRemaining: 30
+                });
+                console.log(`📤 Broadcasted to seller room: ${sellerRoom}`);
+            }
             
             // ✅ Confirm to customer
             const customerRoom = `user_${customerId}`;
@@ -249,6 +306,7 @@ io.on('connection', (socket) => {
             orderTimeouts.set(orderId, timeoutId);
             
             console.log(`📦 Order ${orderId} stored in memory, expires at ${expiresAt.toISOString()}`);
+            console.log(`📊 Total pending orders: ${pendingOrders.size}`);
             
         } catch (error) {
             console.error('❌ Error broadcasting order request:', error);
@@ -694,17 +752,15 @@ io.on('connection', (socket) => {
         console.log(`📊 Active connections: ${io.engine.clientsCount}`);
         
         if (socket.data.userRoom) {
-            socket.leave(socket.data.userRoom);
-        }
-        
-        roomMembers.forEach((members, roomName) => {
-            if (members.has(userId)) {
-                members.delete(userId);
-                if (members.size === 0) {
+            const roomName = socket.data.userRoom;
+            if (roomMembers.has(roomName)) {
+                roomMembers.get(roomName).delete(userId);
+                if (roomMembers.get(roomName).size === 0) {
                     roomMembers.delete(roomName);
                 }
             }
-        });
+            console.log(`📤 Left user room: ${roomName}`);
+        }
     });
 });
 
@@ -838,7 +894,7 @@ async function updateConversationTimestamp(conversationId) {
 // ============================================
 // ✅ START SERVER
 // ============================================
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
 async function startServer() {
     console.log('📊 Testing database connection...');
@@ -865,6 +921,10 @@ async function startServer() {
         console.log(`   🔍 check_pending_order - Check order status (from memory)`);
         console.log(`   ⏰ Auto-expiry after 30 seconds`);
         console.log(`📊 Pending orders in memory: 0`);
+        console.log(`🔍 Debug endpoints:`);
+        console.log(`   - /debug/pending-orders`);
+        console.log(`   - /debug/pending-order/:id`);
+        console.log(`   - /debug/rooms`);
     });
 }
 
